@@ -1,6 +1,7 @@
 name: colmap-reconstruction
 channels:
   - conda-forge
+# COLMAP is expected from the official CUDA Windows bundle at tools/colmap.
 dependencies:
   - python=3.12
   - tqdm>=4.66
