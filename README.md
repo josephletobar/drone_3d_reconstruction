@@ -1,7 +1,7 @@
-# COLMAP Video/Frames-to-Dense-Cloud Orchestrator
+# COLMAP Video/Frames-to-Mesh Orchestrator
 
 Automated pipeline for converting one prerecorded video or one folder of image
-frames into a dense 3D point cloud using COLMAP.
+frames into a 3D mesh using COLMAP sparse/dense reconstruction + Poisson meshing.
 
 ## Usage
 
@@ -29,8 +29,9 @@ python orchestrate.py C:\path\to\image_frames C:\path\to\output
 The conda environment includes Python, `tqdm`, and `ffmpeg`.
 
 On Windows, use the official COLMAP release ZIP instead of the conda COLMAP
-package. Download `colmap-x64-windows-nocuda.zip` from the COLMAP GitHub
-releases page and extract it to `tools/colmap`, so this file exists:
+package. For GPU acceleration, download `colmap-x64-windows-cuda.zip` from the
+COLMAP GitHub releases page and extract it to `tools/colmap`, so this file
+exists:
 
 ```text
 tools/colmap/COLMAP.bat
@@ -38,6 +39,16 @@ tools/colmap/COLMAP.bat
 
 The script uses `tools/colmap/COLMAP.bat` automatically when it is present. This
 batch file sets the required COLMAP library paths before launching the CLI.
+Verify the local COLMAP install with:
+
+```powershell
+.\tools\colmap\COLMAP.bat -h
+```
+
+The first line should include `with CUDA` for GPU support.
+
+The script enables GPU acceleration for feature extraction, feature matching,
+global mapping/bundle adjustment, and PatchMatch stereo.
 
 `requirements.txt` only lists Python package dependencies. It is useful when
 another Python app imports this module and already provides `ffmpeg` and
@@ -47,7 +58,7 @@ another Python app imports this module and already provides `ffmpeg` and
 ```python
 from orchestrate import orchestrate
 
-ply_path = orchestrate(
+mesh_path = orchestrate(
     input_path="/path/to/video.mp4",  # Or "/path/to/image_frames"
     output_folder="/path/to/output",
     skip_frames=0  # Video input only: 0 = all frames, N = sample at 1/N fps
@@ -71,11 +82,12 @@ Supported image extensions: `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, `.bmp`.
 
 ## Output
 
-- `dense.ply` - Dense 3D point cloud saved to output folder
+- `dense.ply` - Triangulated 3D mesh (generated from dense point cloud via Poisson reconstruction)
+
+**Pipeline:** Video/images → Sparse SfM → Dense stereo matching → Poisson mesh
 
 Intermediate files are automatically cleaned up.
 
 ## View Results
 
 Open the `.ply` file in CloudCompare, MeshLab, or any PLY viewer.
-#

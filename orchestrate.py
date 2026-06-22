@@ -6,6 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 import shutil
 import tempfile
+from PIL import Image
 
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv'}
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'}
@@ -35,18 +36,29 @@ def get_image_files(folder):
     return get_media_files(folder, IMAGE_EXTENSIONS)
 
 
-def stage_images(image_files, output_dir):
-    """Copy input images into the COLMAP frames directory."""
+def stage_images(image_files, output_dir, skip_frames=0, max_width=1920):
+    """Copy input images into the COLMAP frames directory, downscaling if needed."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for index, image_file in enumerate(tqdm(image_files, desc="Staging images"), start=1):
+    step = skip_frames if skip_frames > 0 else 1
+    selected_images = image_files[::step]
+
+    for index, image_file in enumerate(tqdm(selected_images, desc="Staging images"), start=1):
         output_name = f"image_{index:06d}{image_file.suffix.lower()}"
-        shutil.copy2(image_file, output_dir / output_name)
+        output_path = output_dir / output_name
 
-    return len(image_files)
+        img = Image.open(image_file)
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+        img.save(output_path, quality=95)
 
-def extract_frames(video_file, output_dir, skip_frames):
-    """Extract frames from one video using ffmpeg."""
+
+    return len(selected_images)
+
+def extract_frames(video_file, output_dir, skip_frames, max_width=1920):
+    """Extract frames from one video using ffmpeg, downscaling if needed."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -55,10 +67,13 @@ def extract_frames(video_file, output_dir, skip_frames):
             "-i", str(video_file),
             "-q:v", "2",
         ]
-        # Only add fps filter if skip_frames is set
+        # Build filter chain: fps filter + scale filter
+        filters = []
         if skip_frames > 0:
-            cmd.extend(["-vf", f"fps=1/{skip_frames}"])
+            filters.append(f"fps=1/{skip_frames}")
+        filters.append(f"scale={max_width}:-1")
 
+        cmd.extend(["-vf", ",".join(filters)])
         cmd.append(str(output_dir / f"{video_file.stem}_%06d.jpg"))
 
         subprocess.run(cmd, check=True, capture_output=True)
@@ -109,17 +124,55 @@ def run_colmap_with_progress(cmd, step_name):
 
 
 def run_colmap_sparse(frames_dir, workspace_dir):
-    """Run COLMAP sparse reconstruction."""
+    """Run COLMAP sparse reconstruction (manual pipeline, no dense)."""
     workspace_dir.mkdir(parents=True, exist_ok=True)
+    db_path = workspace_dir / "database.db"
 
+    # Feature extraction
+    print("Extracting features...")
     cmd = [
-        colmap_command(), "automatic_reconstructor",
-        "--workspace_path", str(workspace_dir),
+        colmap_command(), "feature_extractor",
+        "--database_path", str(db_path),
         "--image_path", str(frames_dir),
-        "--data_type", "VIDEO",
+        "--FeatureExtraction.use_gpu", "1",
+        "--FeatureExtraction.gpu_index", "0",
     ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Feature extraction failed: {e}")
 
-    run_colmap_with_progress(cmd, "Sparse reconstruction")
+    # Feature matching (exhaustive)
+    print("Matching features...")
+    cmd = [
+        colmap_command(), "exhaustive_matcher",
+        "--database_path", str(db_path),
+        "--FeatureMatching.use_gpu", "1",
+        "--FeatureMatching.gpu_index", "0",
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Feature matching failed: {e}")
+
+    # Sparse reconstruction (global mapper for speed)
+    print("Running sparse reconstruction...")
+    sparse_dir = workspace_dir / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        colmap_command(), "global_mapper",
+        "--database_path", str(db_path),
+        "--image_path", str(frames_dir),
+        "--output_path", str(sparse_dir),
+        "--GlobalMapper.gp_use_gpu", "1",
+        "--GlobalMapper.gp_gpu_index", "0",
+        "--GlobalMapper.ba_ceres_use_gpu", "1",
+        "--GlobalMapper.ba_ceres_gpu_index", "0",
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Sparse reconstruction failed: {e}")
 
 def run_colmap_dense(workspace_dir, frames_dir):
     """Run COLMAP dense reconstruction pipeline."""
@@ -133,18 +186,28 @@ def run_colmap_dense(workspace_dir, frames_dir):
         "--input_path", str(sparse_model),
         "--output_path", str(dense_dir),
         "--output_type", "COLMAP",
-        "--max_image_size", "2000",
+        "--max_image_size", "1024",
     ]
-    run_colmap_with_progress(cmd, "Undistorting images")
+    print("Running image undistortion...")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Image undistortion failed: {e}")
 
     # Step 2: Stereo matching
     cmd = [
         colmap_command(), "patch_match_stereo",
         "--workspace_path", str(dense_dir),
         "--workspace_format", "COLMAP",
+        "--PatchMatchStereo.gpu_index", "0",
         "--PatchMatchStereo.geom_consistency", "true",
+        "--PatchMatchStereo.num_iterations", "2",
     ]
-    run_colmap_with_progress(cmd, "Computing depth maps")
+    print("Running stereo matching...")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Stereo matching failed: {e}")
 
     # Step 3: Stereo fusion
     output_ply = dense_dir / "fused.ply"
@@ -155,24 +218,43 @@ def run_colmap_dense(workspace_dir, frames_dir):
         "--input_type", "geometric",
         "--output_path", str(output_ply),
     ]
-    run_colmap_with_progress(cmd, "Fusing depth maps")
+    print("Running stereo fusion...")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Stereo fusion failed: {e}")
 
     return output_ply
 
-def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, frames_dir=None, verbose=True):
+def run_colmap_poisson_mesher(point_cloud_path, output_mesh_path, depth=10):
+    """Convert point cloud to mesh using COLMAP's Poisson mesher."""
+    print("Running Poisson meshing...")
+    cmd = [
+        colmap_command(), "poisson_mesher",
+        "--input_path", str(point_cloud_path),
+        "--output_path", str(output_mesh_path),
+        "--PoissonMeshing.depth", str(depth),
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Poisson meshing failed: {e}")
+
+def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, frames_dir=None, verbose=True, dense=True):
     """
     Run full COLMAP pipeline from one video or one image-frame folder.
 
     Args:
         input_path: Path to a video file or folder containing image frames
-        output_folder: Path where to save dense.ply
+        output_folder: Path where to save mesh.ply
         skip_frames: For video input only, sample at 1/N fps. 0 extracts all frames
         workspace_dir: Override temp workspace directory
         frames_dir: Override temp frames directory
         verbose: Print progress messages
+        dense: If False, sparse only (default True for dense reconstruction + meshing)
 
     Returns:
-        Path to output dense.ply file
+        Path to output mesh.ply file
 
     Raises:
         RuntimeError: If any step fails
@@ -230,8 +312,11 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
 
         if is_image_folder_input:
             if verbose:
-                print("Staging input images")
-            num_frames += stage_images(images, frames_dir)
+                if skip_frames > 0:
+                    print(f"Staging input images (every {skip_frames}th image)")
+                else:
+                    print("Staging input images")
+            num_frames += stage_images(images, frames_dir, skip_frames)
 
         if is_video_input:
             if verbose:
@@ -245,17 +330,55 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
             print(f"Prepared {num_frames} image(s) for reconstruction")
 
         # Run COLMAP pipeline
+        print("\n--- Starting sparse reconstruction ---")
         run_colmap_sparse(frames_dir, workspace_dir)
-        output_ply = run_colmap_dense(workspace_dir, frames_dir)
+        print("✓ Sparse reconstruction complete\n")
 
-        # Copy output
-        final_output = output_folder / "dense.ply"
-        if verbose:
-            print(f"Copying output to {final_output}...")
-        shutil.copy(output_ply, final_output)
+        # Optional dense reconstruction
+        if dense:
+            print("--- Starting dense reconstruction ---")
+            run_colmap_dense(workspace_dir, frames_dir)
+            print("✓ Dense reconstruction complete\n")
 
-        if verbose:
-            print(f"Success! Dense point cloud saved to {final_output}")
+        # Find point cloud (sparse or dense)
+        if dense:
+            # Dense output
+            point_cloud_ply = workspace_dir / "dense" / "fused.ply"
+            if not point_cloud_ply.exists():
+                raise RuntimeError("Dense reconstruction failed: fused.ply not found")
+
+            # Run Poisson meshing on dense cloud
+            final_output = output_folder / "dense.ply"
+            run_colmap_poisson_mesher(point_cloud_ply, final_output, depth=10)
+
+            if verbose:
+                print(f"✓ Meshing complete\nSuccess! Mesh saved to {final_output}")
+        else:
+            # Sparse output - convert to PLY
+            sparse_model_dir = None
+            if (workspace_dir / "sparse" / "0").exists():
+                sparse_model_dir = workspace_dir / "sparse" / "0"
+            elif (workspace_dir / "sparse").exists():
+                sparse_model_dir = workspace_dir / "sparse"
+
+            if not sparse_model_dir or not (sparse_model_dir / "cameras.bin").exists():
+                raise RuntimeError("Sparse reconstruction failed: no model files found")
+
+            final_output = output_folder / "dense.ply"
+            cmd = [
+                colmap_command(), "model_converter",
+                "--input_path", str(sparse_model_dir),
+                "--output_path", str(final_output),
+                "--output_type", "PLY",
+            ]
+            print("Converting sparse model to PLY...")
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Model conversion failed: {e}")
+
+            if verbose:
+                print(f"Success! Point cloud saved to {final_output}")
 
         return final_output
 
