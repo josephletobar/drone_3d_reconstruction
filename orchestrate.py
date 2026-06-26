@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import subprocess
 import sys
 import time
@@ -47,12 +48,13 @@ def get_image_files(folder):
     return get_media_files(folder, IMAGE_EXTENSIONS)
 
 
-def stage_images(image_files, output_dir, skip_frames=0, max_width=1920):
+def stage_images(image_files, output_dir, skip_frames=0, max_width=1920, manifest_path=None):
     """Copy input images into the COLMAP frames directory, downscaling if needed."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     step = skip_frames if skip_frames > 0 else 1
     selected_images = image_files[::step]
+    manifest_rows = []
 
     for index, image_file in enumerate(tqdm(selected_images, desc="Staging images"), start=1):
         output_name = f"image_{index:06d}{image_file.suffix.lower()}"
@@ -65,8 +67,29 @@ def stage_images(image_files, output_dir, skip_frames=0, max_width=1920):
             img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
         img.save(output_path, quality=95)
 
+        manifest_rows.append({
+            "original_name": image_file.name,
+            "original_path": str(image_file),
+            "staged_name": output_name,
+            "staged_path": str(output_path),
+        })
+
+    if manifest_path is not None:
+        write_image_name_map(manifest_path, manifest_rows)
 
     return len(selected_images)
+
+
+def write_image_name_map(manifest_path, rows):
+    """Write the source-to-COLMAP staged image filename map."""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=["original_name", "original_path", "staged_name", "staged_path"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
 
 def extract_frames(video_file, output_dir, skip_frames, max_width=1920):
     """Extract frames from one video using ffmpeg, downscaling if needed."""
@@ -409,7 +432,12 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
                     print(f"Staging input images (every {skip_frames}th image)")
                 else:
                     print("Staging input images")
-            num_frames += stage_images(images, frames_dir, skip_frames)
+            num_frames += stage_images(
+                images,
+                frames_dir,
+                skip_frames,
+                manifest_path=output_folder / "image_name_map.csv",
+            )
 
         if is_video_input:
             if verbose:
