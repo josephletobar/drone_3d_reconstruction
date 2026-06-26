@@ -2,6 +2,7 @@
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tqdm import tqdm
 import shutil
@@ -18,6 +19,16 @@ def colmap_command():
     if LOCAL_COLMAP.exists():
         return str(LOCAL_COLMAP)
     return "colmap"
+
+
+def format_duration(seconds):
+    """Format elapsed seconds as h:mm:ss or m:ss."""
+    seconds = int(round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
 
 
 def get_media_files(folder, extensions):
@@ -201,7 +212,7 @@ def run_colmap_dense(workspace_dir, frames_dir):
         "--workspace_format", "COLMAP",
         "--PatchMatchStereo.gpu_index", "0",
         "--PatchMatchStereo.geom_consistency", "true",
-        "--PatchMatchStereo.num_iterations", "2",
+        "--PatchMatchStereo.num_iterations", "1",
     ]
     print("Running stereo matching...")
     try:
@@ -240,6 +251,87 @@ def run_colmap_poisson_mesher(point_cloud_path, output_mesh_path, depth=10):
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Poisson meshing failed: {e}")
 
+
+def has_sparse_model_files(model_dir):
+    """Return True when a COLMAP sparse model directory has camera and image files."""
+    return (
+        (model_dir / "cameras.bin").exists()
+        or (model_dir / "cameras.txt").exists()
+    ) and (
+        (model_dir / "images.bin").exists()
+        or (model_dir / "images.txt").exists()
+    )
+
+
+def find_sparse_model_dir(workspace_dir):
+    """Find the first sparse model directory COLMAP produced."""
+    sparse_root = workspace_dir / "sparse"
+    candidates = [sparse_root / "0", sparse_root]
+
+    if sparse_root.exists():
+        candidates.extend(
+            path
+            for path in sorted(sparse_root.iterdir())
+            if path.is_dir() and path not in candidates
+        )
+
+    for candidate in candidates:
+        if candidate.exists() and has_sparse_model_files(candidate):
+            return candidate
+
+    return None
+
+
+def save_colmap_artifacts(workspace_dir, output_folder, verbose=True):
+    """Save sparse metadata and dense fusion artifacts before cleanup."""
+    sparse_model_dir = find_sparse_model_dir(workspace_dir)
+    if sparse_model_dir is None:
+        raise RuntimeError("Could not find sparse model files to save")
+
+    saved_paths = []
+    output_sparse_dir = output_folder / "sparse"
+    output_sparse_dir.mkdir(parents=True, exist_ok=True)
+
+    for artifact in sparse_model_dir.iterdir():
+        if artifact.is_file() and artifact.suffix.lower() in {".bin", ".txt"}:
+            destination = output_sparse_dir / artifact.name
+            shutil.copy2(artifact, destination)
+            saved_paths.append(destination)
+
+    # Also write text versions when COLMAP produced binary sparse files.
+    if not (output_sparse_dir / "cameras.txt").exists() or not (output_sparse_dir / "images.txt").exists():
+        cmd = [
+            colmap_command(), "model_converter",
+            "--input_path", str(sparse_model_dir),
+            "--output_path", str(output_sparse_dir),
+            "--output_type", "TXT",
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+            saved_paths.extend(
+                path
+                for path in output_sparse_dir.glob("*.txt")
+                if path not in saved_paths
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Could not export sparse text files: {e}")
+
+    dense_dir = workspace_dir / "dense"
+    output_dense_dir = output_folder / "dense"
+    for artifact_name in ("fused.ply", "fused.ply.vis"):
+        artifact = dense_dir / artifact_name
+        if artifact.exists():
+            output_dense_dir.mkdir(parents=True, exist_ok=True)
+            destination = output_dense_dir / artifact.name
+            shutil.copy2(artifact, destination)
+            saved_paths.append(destination)
+
+    if verbose:
+        print(f"Saved COLMAP artifacts to {output_folder}")
+
+    return saved_paths
+
+
 def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, frames_dir=None, verbose=True, dense=True):
     """
     Run full COLMAP pipeline from one video or one image-frame folder.
@@ -260,6 +352,7 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
         RuntimeError: If any step fails
         ValueError: If inputs are invalid
     """
+    pipeline_start = time.perf_counter()
     input_path = Path(input_path)
     output_folder = Path(output_folder)
 
@@ -355,13 +448,9 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
                 print(f"✓ Meshing complete\nSuccess! Mesh saved to {final_output}")
         else:
             # Sparse output - convert to PLY
-            sparse_model_dir = None
-            if (workspace_dir / "sparse" / "0").exists():
-                sparse_model_dir = workspace_dir / "sparse" / "0"
-            elif (workspace_dir / "sparse").exists():
-                sparse_model_dir = workspace_dir / "sparse"
+            sparse_model_dir = find_sparse_model_dir(workspace_dir)
 
-            if not sparse_model_dir or not (sparse_model_dir / "cameras.bin").exists():
+            if sparse_model_dir is None:
                 raise RuntimeError("Sparse reconstruction failed: no model files found")
 
             final_output = output_folder / "dense.ply"
@@ -380,12 +469,18 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
             if verbose:
                 print(f"Success! Point cloud saved to {final_output}")
 
+        save_colmap_artifacts(workspace_dir, output_folder, verbose)
+
         return final_output
 
     except Exception as e:
         raise RuntimeError(f"Pipeline failed: {e}") from e
 
     finally:
+        elapsed = format_duration(time.perf_counter() - pipeline_start)
+        if verbose:
+            print(f"Pipeline elapsed time: {elapsed}")
+
         # Cleanup
         if verbose:
             print("Cleaning up temporary files...")
