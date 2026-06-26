@@ -81,3 +81,7 @@ Pipeline: video/images -> sparse SfM -> dense stereo -> Poisson mesh.
 Intermediate files are automatically cleaned up.
 
 Open the `.ply` file in CloudCompare, MeshLab, or another PLY viewer.
+
+**Example:**
+<img width="1285" height="809" alt="image" src="https://github.com/user-attachments/assets/9e4aa971-a5f4-4950-8b0e-e6775a34a076" />
+
