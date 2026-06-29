@@ -10,15 +10,18 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from .orchestrate import ReconstructionResult
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
-LOCAL_COLMAP = Path(__file__).resolve().parent / "tools" / "colmap" / "COLMAP.bat"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_COLMAP = PROJECT_ROOT / "tools" / "colmap" / "COLMAP.bat"
 DEFAULT_HEATMAP_ALPHA = 0.6
-DEFAULT_HEATMAP_GLOBAL_BLUR_STRENGTH = 1.0
-DEFAULT_HEATMAP_GLOBAL_BLUR_FRACTION = 0.10
+DEFAULT_HEATMAP_GLOBAL_BLUR_STRENGTH = 0.0
+DEFAULT_HEATMAP_GLOBAL_BLUR_FRACTION = 0.0
 DEFAULT_HEATMAP_GLOBAL_BLUR_GRID_DIVISIONS = 6
-DEFAULT_HEATMAP_SMOOTH_ITERATIONS = 5
-DEFAULT_HEATMAP_SMOOTH_STRENGTH = 1
+DEFAULT_HEATMAP_SMOOTH_ITERATIONS = 0
+DEFAULT_HEATMAP_SMOOTH_STRENGTH = 0
 PLY_SCALAR_FORMATS = {
     "char": "b",
     "uchar": "B",
@@ -37,6 +40,22 @@ PLY_SCALAR_FORMATS = {
     "double": "d",
     "float64": "d",
 }
+
+
+@dataclass(frozen=True)
+class HeatmapProjectionResult:
+    """Paths and matching metadata produced by heatmap projection."""
+
+    reconstruction: ReconstructionResult
+    heatmap_dir: Path
+    method: str
+    output_mesh_path: Path
+    texture_path: Path | None
+    matched_images: tuple[str, ...]
+    missing_heatmaps: tuple[str, ...]
+    extra_heatmaps: tuple[str, ...]
+    assigned_vertices: int | None
+    total_vertices: int | None
 
 
 def colmap_command():
@@ -817,6 +836,82 @@ def apply_heatmaps_to_mesh(
     return sync_data, mesh_output, texture_output
 
 
+def project_heatmaps(
+    reconstruction,
+    heatmap_dir,
+    method="vertex-colors",
+    output_path=None,
+    output_dir=None,
+    mesh_path=None,
+    keep_workspace=False,
+    heatmap_alpha=DEFAULT_HEATMAP_ALPHA,
+    heatmap_only=False,
+    heatmap_global_blur_fraction=DEFAULT_HEATMAP_GLOBAL_BLUR_FRACTION,
+    heatmap_global_blur_strength=DEFAULT_HEATMAP_GLOBAL_BLUR_STRENGTH,
+    heatmap_global_blur_grid_divisions=DEFAULT_HEATMAP_GLOBAL_BLUR_GRID_DIVISIONS,
+    heatmap_smooth_iterations=DEFAULT_HEATMAP_SMOOTH_ITERATIONS,
+    heatmap_smooth_strength=DEFAULT_HEATMAP_SMOOTH_STRENGTH,
+):
+    """Project heatmaps onto a reconstructed mesh and return structured outputs."""
+    if method not in {"vertex-colors", "mesh-texturer"}:
+        raise ValueError("method must be 'vertex-colors' or 'mesh-texturer'")
+
+    if not isinstance(reconstruction, ReconstructionResult):
+        raise TypeError("reconstruction must be a ReconstructionResult")
+
+    heatmap_dir = Path(heatmap_dir)
+    geometry_path = Path(mesh_path) if mesh_path is not None else reconstruction.mesh_path
+
+    if method == "vertex-colors":
+        sync_data, mesh_output, assigned_count, vertex_count = apply_heatmaps_as_vertex_colors(
+            reconstruction.output_dir,
+            heatmap_dir,
+            output_path=output_path,
+            mesh_path=geometry_path,
+            heatmap_alpha=heatmap_alpha,
+            heatmap_only=heatmap_only,
+            heatmap_global_blur_fraction=heatmap_global_blur_fraction,
+            heatmap_global_blur_strength=heatmap_global_blur_strength,
+            heatmap_global_blur_grid_divisions=heatmap_global_blur_grid_divisions,
+            heatmap_smooth_iterations=heatmap_smooth_iterations,
+            heatmap_smooth_strength=heatmap_smooth_strength,
+        )
+        return HeatmapProjectionResult(
+            reconstruction=reconstruction,
+            heatmap_dir=heatmap_dir,
+            method=method,
+            output_mesh_path=mesh_output,
+            texture_path=None,
+            matched_images=tuple(sync_data["matched_names"]),
+            missing_heatmaps=tuple(sync_data["missing_heatmaps"]),
+            extra_heatmaps=tuple(sync_data["extra_heatmaps"]),
+            assigned_vertices=assigned_count,
+            total_vertices=vertex_count,
+        )
+
+    sync_data, mesh_output, texture_output = apply_heatmaps_to_mesh(
+        reconstruction.output_dir,
+        heatmap_dir,
+        output_dir=output_dir,
+        mesh_path=geometry_path,
+        keep_workspace=keep_workspace,
+        heatmap_alpha=heatmap_alpha,
+        heatmap_only=heatmap_only,
+    )
+    return HeatmapProjectionResult(
+        reconstruction=reconstruction,
+        heatmap_dir=heatmap_dir,
+        method=method,
+        output_mesh_path=mesh_output,
+        texture_path=texture_output,
+        matched_images=tuple(sync_data["matched_names"]),
+        missing_heatmaps=tuple(sync_data["missing_heatmaps"]),
+        extra_heatmaps=tuple(sync_data["extra_heatmaps"]),
+        assigned_vertices=None,
+        total_vertices=None,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Project heatmap images onto a COLMAP mesh."
@@ -876,6 +971,10 @@ def main():
 
     colmap_output = Path(args.colmap_output)
     heatmap_folder = Path(args.heatmap_folder)
+    reconstruction = ReconstructionResult.from_output_dir(
+        colmap_output,
+        mesh_path=args.mesh,
+    )
 
     try:
         sync_data = load_sync_data(colmap_output, heatmap_folder, args.mesh)
@@ -908,7 +1007,7 @@ def main():
     if missing_heatmaps:
         if not sync_data["image_name_map_path"]:
             print(
-                "Hint: If COLMAP renamed your source images, rerun orchestrate.py "
+                "Hint: If COLMAP renamed your source images, rerun colmap-orchestrate "
                 "to create image_name_map.csv in the output folder.",
                 file=sys.stderr,
             )
@@ -936,9 +1035,10 @@ def main():
                 f"strength {DEFAULT_HEATMAP_SMOOTH_STRENGTH}"
             )
         try:
-            _, mesh_output, assigned_count, vertex_count = apply_heatmaps_as_vertex_colors(
-                colmap_output,
+            result = project_heatmaps(
+                reconstruction,
                 heatmap_folder,
+                method="vertex-colors",
                 output_path=output_ply,
                 mesh_path=args.mesh,
                 heatmap_alpha=args.heatmap_alpha,
@@ -949,13 +1049,13 @@ def main():
             sys.exit(1)
 
         print("Heatmap vertex coloring complete")
-        print(f"Mesh output: {mesh_output}")
-        print(f"Colored vertices: {assigned_count} / {vertex_count}")
-        if assigned_count < vertex_count:
+        print(f"Mesh output: {result.output_mesh_path}")
+        print(f"Colored vertices: {result.assigned_vertices} / {result.total_vertices}")
+        if result.assigned_vertices < result.total_vertices:
             print("Note: unprojected vertices were left neutral gray")
         return
 
-    output_dir = Path(args.output_dir) if args.output_dir else colmap_output / "heatmapped_mesh"
+    output_dir = Path(args.output_dir) if args.output_dir else None
     print("Building heatmap texture workspace and running COLMAP mesh_texturer...")
     if args.heatmap_only:
         print("Texture source: heatmaps only")
@@ -963,9 +1063,10 @@ def main():
         print(f"Texture source: original images blended with heatmaps at alpha {args.heatmap_alpha}")
     print("View selection: COLMAP best projected-area image per face")
     try:
-        _, mesh_output, texture_output = apply_heatmaps_to_mesh(
-            colmap_output,
+        result = project_heatmaps(
+            reconstruction,
             heatmap_folder,
+            method="mesh-texturer",
             output_dir=output_dir,
             mesh_path=args.mesh,
             keep_workspace=args.keep_workspace,
@@ -977,8 +1078,8 @@ def main():
         sys.exit(1)
 
     print("Heatmap texturing complete")
-    print(f"Mesh output: {mesh_output}")
-    print(f"Texture output: {texture_output}")
+    print(f"Mesh output: {result.output_mesh_path}")
+    print(f"Texture output: {result.texture_path}")
 
 
 if __name__ == "__main__":

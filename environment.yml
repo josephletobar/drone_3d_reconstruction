@@ -4,6 +4,7 @@ channels:
 # COLMAP is expected from the official CUDA Windows bundle at tools/colmap.
 dependencies:
   - python=3.12
+  - pip
   - tqdm>=4.66
   - pillow
   - numpy

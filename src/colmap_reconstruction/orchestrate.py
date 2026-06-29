@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from tqdm import tqdm
 import shutil
@@ -12,11 +14,58 @@ from PIL import Image
 
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv'}
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'}
-LOCAL_COLMAP = Path(__file__).resolve().parent / "tools" / "colmap" / "COLMAP.bat"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_COLMAP = PROJECT_ROOT / "tools" / "colmap" / "COLMAP.bat"
+DEFAULT_MAX_IMAGE_SIZE = 640
+
+
+@dataclass(frozen=True)
+class ReconstructionResult:
+    """Paths and metadata produced by a COLMAP reconstruction run."""
+
+    input_path: Path | None
+    output_dir: Path
+    mesh_path: Path
+    sparse_dir: Path
+    dense_dir: Path
+    image_name_map_path: Path | None
+    artifact_paths: tuple[Path, ...]
+    frame_count: int
+    dense: bool
+
+    @classmethod
+    def from_output_dir(
+        cls,
+        output_dir,
+        input_path=None,
+        mesh_path=None,
+        dense=True,
+        artifact_paths=(),
+        frame_count=0,
+    ):
+        """Build a result object for an existing reconstruction output folder."""
+        output_dir = Path(output_dir)
+        image_name_map_path = output_dir / "image_name_map.csv"
+        return cls(
+            input_path=Path(input_path) if input_path is not None else None,
+            output_dir=output_dir,
+            mesh_path=Path(mesh_path) if mesh_path is not None else output_dir / "dense.ply",
+            sparse_dir=output_dir / "sparse",
+            dense_dir=output_dir / "dense",
+            image_name_map_path=(
+                image_name_map_path if image_name_map_path.exists() else None
+            ),
+            artifact_paths=tuple(Path(path) for path in artifact_paths),
+            frame_count=frame_count,
+            dense=dense,
+        )
 
 
 def colmap_command():
     """Return the preferred COLMAP command."""
+    custom_colmap = os.environ.get("COLMAP_EXE")
+    if custom_colmap:
+        return custom_colmap
     if LOCAL_COLMAP.exists():
         return str(LOCAL_COLMAP)
     return "colmap"
@@ -48,7 +97,18 @@ def get_image_files(folder):
     return get_media_files(folder, IMAGE_EXTENSIONS)
 
 
-def stage_images(image_files, output_dir, skip_frames=0, max_width=1920, manifest_path=None):
+def get_video_files(folder):
+    """Get all video files from folder."""
+    return get_media_files(folder, VIDEO_EXTENSIONS)
+
+
+def stage_images(
+    image_files,
+    output_dir,
+    skip_frames=0,
+    max_image_size=DEFAULT_MAX_IMAGE_SIZE,
+    manifest_path=None,
+):
     """Copy input images into the COLMAP frames directory, downscaling if needed."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -61,10 +121,12 @@ def stage_images(image_files, output_dir, skip_frames=0, max_width=1920, manifes
         output_path = output_dir / output_name
 
         img = Image.open(image_file)
-        if img.width > max_width:
-            ratio = max_width / img.width
+        longest_edge = max(img.width, img.height)
+        if longest_edge > max_image_size:
+            ratio = max_image_size / longest_edge
+            new_width = int(img.width * ratio)
             new_height = int(img.height * ratio)
-            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
         img.save(output_path, quality=95)
 
         manifest_rows.append({
@@ -80,6 +142,14 @@ def stage_images(image_files, output_dir, skip_frames=0, max_width=1920, manifes
     return len(selected_images)
 
 
+def ffmpeg_max_edge_scale_filter(max_image_size):
+    """Return an ffmpeg scale filter that preserves aspect ratio by longest edge."""
+    return (
+        f"scale='if(gte(iw,ih),min({max_image_size},iw),-2)':"
+        f"'if(gte(iw,ih),-2,min({max_image_size},ih))'"
+    )
+
+
 def write_image_name_map(manifest_path, rows):
     """Write the source-to-COLMAP staged image filename map."""
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,7 +161,12 @@ def write_image_name_map(manifest_path, rows):
         writer.writeheader()
         writer.writerows(rows)
 
-def extract_frames(video_file, output_dir, skip_frames, max_width=1920):
+def extract_frames(
+    video_file,
+    output_dir,
+    skip_frames,
+    max_image_size=DEFAULT_MAX_IMAGE_SIZE,
+):
     """Extract frames from one video using ffmpeg, downscaling if needed."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -105,7 +180,7 @@ def extract_frames(video_file, output_dir, skip_frames, max_width=1920):
         filters = []
         if skip_frames > 0:
             filters.append(f"fps=1/{skip_frames}")
-        filters.append(f"scale={max_width}:-1")
+        filters.append(ffmpeg_max_edge_scale_filter(max_image_size))
 
         cmd.extend(["-vf", ",".join(filters)])
         cmd.append(str(output_dir / f"{video_file.stem}_%06d.jpg"))
@@ -208,7 +283,11 @@ def run_colmap_sparse(frames_dir, workspace_dir):
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Sparse reconstruction failed: {e}")
 
-def run_colmap_dense(workspace_dir, frames_dir):
+def run_colmap_dense(
+    workspace_dir,
+    frames_dir,
+    max_image_size=DEFAULT_MAX_IMAGE_SIZE,
+):
     """Run COLMAP dense reconstruction pipeline."""
     dense_dir = workspace_dir / "dense"
     sparse_model = workspace_dir / "sparse" / "0"
@@ -220,7 +299,7 @@ def run_colmap_dense(workspace_dir, frames_dir):
         "--input_path", str(sparse_model),
         "--output_path", str(dense_dir),
         "--output_type", "COLMAP",
-        "--max_image_size", "1024",
+        "--max_image_size", str(max_image_size),
     ]
     print("Running image undistortion...")
     try:
@@ -355,21 +434,31 @@ def save_colmap_artifacts(workspace_dir, output_folder, verbose=True):
     return saved_paths
 
 
-def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, frames_dir=None, verbose=True, dense=True):
+def reconstruct(
+    input_path,
+    output_dir,
+    skip_frames=0,
+    max_image_size=DEFAULT_MAX_IMAGE_SIZE,
+    workspace_dir=None,
+    frames_dir=None,
+    verbose=True,
+    dense=True,
+):
     """
-    Run full COLMAP pipeline from one video or one image-frame folder.
+    Run full COLMAP pipeline from one video, a video folder, or an image-frame folder.
 
     Args:
-        input_path: Path to a video file or folder containing image frames
-        output_folder: Path where to save mesh.ply
+        input_path: Path to a video file, folder of videos, or folder containing image frames
+        output_dir: Path where to save reconstruction artifacts
         skip_frames: For video input only, sample at 1/N fps. 0 extracts all frames
+        max_image_size: Resize prepared images so the longest edge is at most this many pixels
         workspace_dir: Override temp workspace directory
         frames_dir: Override temp frames directory
         verbose: Print progress messages
         dense: If False, sparse only (default True for dense reconstruction + meshing)
 
     Returns:
-        Path to output mesh.ply file
+        ReconstructionResult with output paths and run metadata
 
     Raises:
         RuntimeError: If any step fails
@@ -377,7 +466,7 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
     """
     pipeline_start = time.perf_counter()
     input_path = Path(input_path)
-    output_folder = Path(output_folder)
+    output_dir = Path(output_dir)
 
     temp_root = None
     if workspace_dir is None or frames_dir is None:
@@ -397,29 +486,29 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
     if not input_path.exists():
         raise ValueError(f"Input path '{input_path}' does not exist")
 
-    output_folder.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     is_video_input = input_path.is_file() and input_path.suffix.lower() in VIDEO_EXTENSIONS
-    is_image_folder_input = input_path.is_dir()
+    is_folder_input = input_path.is_dir()
+    videos = get_video_files(input_path) if is_folder_input else []
+    images = get_image_files(input_path) if is_folder_input and not videos else []
+    is_video_folder_input = bool(videos)
+    is_image_folder_input = bool(images)
 
-    if not is_video_input and not is_image_folder_input:
+    if not is_video_input and not is_video_folder_input and not is_image_folder_input:
         video_extensions = ", ".join(sorted(VIDEO_EXTENSIONS))
-        raise ValueError(
-            f"Input must be one video file or one folder of image frames. "
-            f"Supported video extensions: {video_extensions}"
-        )
-
-    images = get_image_files(input_path) if is_image_folder_input else []
-    if is_image_folder_input and not images:
         image_extensions = ", ".join(sorted(IMAGE_EXTENSIONS))
         raise ValueError(
-            f"No image files found in '{input_path}'. "
+            f"Input must be one video file, one folder of videos, or one folder of image frames. "
+            f"Supported video extensions: {video_extensions}. "
             f"Supported image extensions: {image_extensions}"
         )
 
     if verbose:
         if is_video_input:
             print(f"Found video input: {input_path}")
+        elif is_video_folder_input:
+            print(f"Found {len(videos)} video file(s)")
         else:
             print(f"Found {len(images)} image frame(s)")
 
@@ -436,16 +525,26 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
                 images,
                 frames_dir,
                 skip_frames,
-                manifest_path=output_folder / "image_name_map.csv",
+                max_image_size=max_image_size,
+                manifest_path=output_dir / "image_name_map.csv",
             )
 
-        if is_video_input:
+        if is_video_input or is_video_folder_input:
+            video_inputs = [input_path] if is_video_input else videos
             if verbose:
                 if skip_frames > 0:
                     print(f"Extracting video frames at 1/{skip_frames} fps")
                 else:
-                    print("Extracting all frames from video")
-            num_frames += extract_frames(input_path, frames_dir, skip_frames)
+                    print("Extracting all frames from video input")
+            for video_file in video_inputs:
+                if verbose and is_video_folder_input:
+                    print(f"Extracting frames from {video_file.name}")
+                num_frames += extract_frames(
+                    video_file,
+                    frames_dir,
+                    skip_frames,
+                    max_image_size=max_image_size,
+                )
 
         if verbose:
             print(f"Prepared {num_frames} image(s) for reconstruction")
@@ -453,13 +552,17 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
         # Run COLMAP pipeline
         print("\n--- Starting sparse reconstruction ---")
         run_colmap_sparse(frames_dir, workspace_dir)
-        print("✓ Sparse reconstruction complete\n")
+        print("Sparse reconstruction complete\n")
 
         # Optional dense reconstruction
         if dense:
             print("--- Starting dense reconstruction ---")
-            run_colmap_dense(workspace_dir, frames_dir)
-            print("✓ Dense reconstruction complete\n")
+            run_colmap_dense(
+                workspace_dir,
+                frames_dir,
+                max_image_size=max_image_size,
+            )
+            print("Dense reconstruction complete\n")
 
         # Find point cloud (sparse or dense)
         if dense:
@@ -469,11 +572,11 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
                 raise RuntimeError("Dense reconstruction failed: fused.ply not found")
 
             # Run Poisson meshing on dense cloud
-            final_output = output_folder / "dense.ply"
+            final_output = output_dir / "dense.ply"
             run_colmap_poisson_mesher(point_cloud_ply, final_output, depth=10)
 
             if verbose:
-                print(f"✓ Meshing complete\nSuccess! Mesh saved to {final_output}")
+                print(f"Meshing complete\nSuccess! Mesh saved to {final_output}")
         else:
             # Sparse output - convert to PLY
             sparse_model_dir = find_sparse_model_dir(workspace_dir)
@@ -481,7 +584,7 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
             if sparse_model_dir is None:
                 raise RuntimeError("Sparse reconstruction failed: no model files found")
 
-            final_output = output_folder / "dense.ply"
+            final_output = output_dir / "dense.ply"
             cmd = [
                 colmap_command(), "model_converter",
                 "--input_path", str(sparse_model_dir),
@@ -497,9 +600,22 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
             if verbose:
                 print(f"Success! Point cloud saved to {final_output}")
 
-        save_colmap_artifacts(workspace_dir, output_folder, verbose)
+        artifact_paths = save_colmap_artifacts(workspace_dir, output_dir, verbose)
+        image_name_map_path = output_dir / "image_name_map.csv"
 
-        return final_output
+        return ReconstructionResult(
+            input_path=input_path,
+            output_dir=output_dir,
+            mesh_path=final_output,
+            sparse_dir=output_dir / "sparse",
+            dense_dir=output_dir / "dense",
+            image_name_map_path=(
+                image_name_map_path if image_name_map_path.exists() else None
+            ),
+            artifact_paths=tuple(artifact_paths),
+            frame_count=num_frames,
+            dense=dense,
+        )
 
     except Exception as e:
         raise RuntimeError(f"Pipeline failed: {e}") from e
@@ -520,12 +636,43 @@ def orchestrate(input_path, output_folder, skip_frames=0, workspace_dir=None, fr
             shutil.rmtree(temp_root)
 
 
+def orchestrate(
+    input_path,
+    output_folder,
+    skip_frames=0,
+    max_image_size=DEFAULT_MAX_IMAGE_SIZE,
+    workspace_dir=None,
+    frames_dir=None,
+    verbose=True,
+    dense=True,
+):
+    """
+    Compatibility wrapper for the older path-returning API.
+
+    Prefer reconstruct(...) for new Python code.
+    """
+    result = reconstruct(
+        input_path,
+        output_folder,
+        skip_frames=skip_frames,
+        max_image_size=max_image_size,
+        workspace_dir=workspace_dir,
+        frames_dir=frames_dir,
+        verbose=verbose,
+        dense=dense,
+    )
+    return result.mesh_path
+
+
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="COLMAP video/file-frames-to-dense-cloud orchestrator"
+        description="COLMAP video/video-folder/file-frames-to-dense-cloud orchestrator"
     )
-    parser.add_argument("input_path", help="Path to one video file or one folder of image frames")
+    parser.add_argument(
+        "input_path",
+        help="Path to one video file, one folder of videos, or one folder of image frames",
+    )
     parser.add_argument("output_folder", help="Path where to save dense.ply")
     parser.add_argument(
         "--skip-frames",
@@ -533,10 +680,25 @@ def main():
         default=0,
         help="For video input only, sample at 1/N fps. 0 extracts all frames",
     )
+    parser.add_argument(
+        "--max-image-size",
+        type=int,
+        default=DEFAULT_MAX_IMAGE_SIZE,
+        help=(
+            "Resize prepared images so the longest edge is at most this many "
+            f"pixels. Defaults to {DEFAULT_MAX_IMAGE_SIZE}"
+        ),
+    )
     args = parser.parse_args()
 
     try:
-        orchestrate(args.input_path, args.output_folder, args.skip_frames)
+        result = reconstruct(
+            args.input_path,
+            args.output_folder,
+            skip_frames=args.skip_frames,
+            max_image_size=args.max_image_size,
+        )
+        print(f"Mesh output: {result.mesh_path}")
     except (ValueError, RuntimeError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

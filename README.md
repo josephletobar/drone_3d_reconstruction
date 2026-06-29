@@ -10,6 +10,16 @@ Create the Python/ffmpeg conda environment:
 ```powershell
 conda env create -f environment.yml
 conda activate colmap-reconstruction
+python -m pip install -e .
+```
+
+If the environment already exists and `python -m pip` is missing, install pip
+once:
+
+```powershell
+conda install -n colmap-reconstruction pip
+conda activate colmap-reconstruction
+python -m pip install -e .
 ```
 
 Install the official CUDA COLMAP Windows bundle:
@@ -31,9 +41,9 @@ Run from this project folder:
 ```powershell
 conda activate colmap-reconstruction
 # Option 1: video input
-python orchestrate.py C:\path\to\video.mp4 C:\path\to\output
+colmap-orchestrate C:\path\to\video.mp4 C:\path\to\output
 # OR option 2: image-frame folder input
-python orchestrate.py C:\path\to\image_frames C:\path\to\output
+colmap-orchestrate C:\path\to\image_frames C:\path\to\output
 ```
 
 The input must be either:
@@ -48,29 +58,43 @@ Supported image extensions: `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, `.bmp`.
 ## Python Module
 
 ```python
-from orchestrate import orchestrate
+from colmap_reconstruction import project_heatmaps, reconstruct
 
-mesh_path = orchestrate(
+reconstruction = reconstruct(
     input_path="/path/to/video.mp4",  # Or "/path/to/image_frames"
-    output_folder="/path/to/output",
+    output_dir="/path/to/output",
     skip_frames=0,
+    max_image_size=640,
 )
+
+heatmapped = project_heatmaps(
+    reconstruction=reconstruction,
+    heatmap_dir="/path/to/heatmaps",
+)
+
+print(reconstruction.mesh_path)
+print(heatmapped.output_mesh_path)
 ```
 
-`requirements.txt` lists only Python package dependencies for apps that import
-this module. COLMAP CUDA and ffmpeg are still runtime requirements.
+Python package dependencies are declared in `pyproject.toml`. COLMAP CUDA and
+ffmpeg are still runtime requirements.
 
 ## Options
 
 | Flag | Purpose | Default |
 |------|---------|---------|
 | `--skip-frames N` | For video input, sample every Nth frame | `0` = all frames |
+| `--max-image-size N` | Resize prepared images so the longest edge is at most N pixels | `640` |
 
 For image-frame folder input, `--skip-frames N` samples every Nth image.
+`--max-image-size N` preserves aspect ratio for landscape, portrait, and square
+inputs by scaling the longest edge.
 
 > **Note:** Recommend starting with `--skip-frames` at 0 for best results.
 > Increase from there based on results to speed up processing or if your video
 > has redundant high framerate footage.
+> Likewise, start with the default `--max-image-size 640`; increase to 768 or
+> 1024 only if the reconstruction is too sparse or loses detail.
 
 ## Output
 
@@ -84,4 +108,21 @@ Open the `.ply` file in CloudCompare, MeshLab, or another PLY viewer.
 
 **Example:**
 <img width="1285" height="809" alt="image" src="https://github.com/user-attachments/assets/9e4aa971-a5f4-4950-8b0e-e6775a34a076" />
+
+## Heatmap Projection
+
+After installing editable, project heatmaps onto a completed COLMAP output:
+
+```powershell
+colmap-heatmaps C:\path\to\colmap_output C:\path\to\heatmaps
+```
+
+From Python, pass the reconstruction result into heatmap projection:
+
+```python
+from colmap_reconstruction import project_heatmaps
+
+heatmap_result = project_heatmaps(reconstruction, "/path/to/heatmaps")
+print(heatmap_result.output_mesh_path)
+```
 

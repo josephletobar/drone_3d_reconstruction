@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colmap-reconstruction"
+version = "0.1.0"
+description = "COLMAP reconstruction and heatmap projection tools"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "tqdm>=4.66",
+    "pillow",
+    "numpy",
+]
+
+[project.scripts]
+colmap-orchestrate = "colmap_reconstruction.orchestrate:main"
+colmap-heatmaps = "colmap_reconstruction.apply_heatmaps:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
