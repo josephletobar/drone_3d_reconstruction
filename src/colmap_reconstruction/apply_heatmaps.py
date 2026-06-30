@@ -219,6 +219,27 @@ def print_name_list(title, names, limit=10):
         print(f"  ... and {len(names) - limit} more")
 
 
+def require_heatmap_matches(sync_data):
+    """Ensure there is at least one matching heatmap to project."""
+    if sync_data["heatmap_matches"]:
+        return
+
+    raise ValueError("No COLMAP images have matching heatmaps.")
+
+
+def warn_partial_heatmap_matches(sync_data):
+    """Warn about imperfect heatmap sync without blocking projection."""
+    missing_heatmaps = sync_data["missing_heatmaps"]
+    if not missing_heatmaps:
+        return
+
+    print(
+        "Warning: Some COLMAP images do not have matching heatmaps; "
+        f"continuing with {len(sync_data['heatmap_matches'])} matched image(s).",
+        file=sys.stderr,
+    )
+
+
 def load_sync_data(colmap_output, heatmap_folder, mesh_path=None):
     cameras_txt, images_txt = validate_inputs(colmap_output, heatmap_folder)
 
@@ -276,6 +297,35 @@ def blend_images(base_path, heatmap_path, output_path, heatmap_alpha):
             heatmap_image = heatmap_image.resize(base_image.size, Image.Resampling.BILINEAR)
         blended = Image.blend(base_image, heatmap_image, heatmap_alpha)
         blended.save(output_path)
+
+
+def filter_sparse_images_txt(sparse_dir, kept_image_names):
+    """Keep only matched images in a copied COLMAP text sparse model."""
+    images_txt = sparse_dir / "images.txt"
+    kept_image_names = set(kept_image_names)
+    lines = images_txt.read_text(encoding="utf-8").splitlines()
+    filtered_lines = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            filtered_lines.append(line)
+            index += 1
+            continue
+
+        parts = stripped.split(maxsplit=9)
+        if len(parts) < 10:
+            raise ValueError(f"Invalid images.txt line {index + 1}: {line}")
+
+        points_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if parts[9] in kept_image_names:
+            filtered_lines.append(line)
+            filtered_lines.append(points_line)
+        index += 2
+
+    images_txt.write_text("\n".join(filtered_lines) + "\n", encoding="utf-8")
 
 
 def qvec_to_rotmat(qvec):
@@ -633,14 +683,16 @@ def apply_heatmaps_as_vertex_colors(
     heatmap_global_blur_grid_divisions=DEFAULT_HEATMAP_GLOBAL_BLUR_GRID_DIVISIONS,
     heatmap_smooth_iterations=DEFAULT_HEATMAP_SMOOTH_ITERATIONS,
     heatmap_smooth_strength=DEFAULT_HEATMAP_SMOOTH_STRENGTH,
+    warn_on_partial=True,
 ):
     """Color mesh vertices by projecting them into the latest valid heatmap image."""
     import numpy as np
     from PIL import Image
 
     sync_data = load_sync_data(colmap_output, heatmap_folder, mesh_path)
-    if sync_data["missing_heatmaps"]:
-        raise ValueError("Some COLMAP images do not have matching heatmaps.")
+    require_heatmap_matches(sync_data)
+    if warn_on_partial:
+        warn_partial_heatmap_matches(sync_data)
 
     vertices, faces = read_ply_mesh(sync_data["geometry_path"])
     base_colors = np.full((len(vertices), 3), 180, dtype=np.float32)
@@ -738,6 +790,7 @@ def build_heatmap_workspace(
 
     workspace_path.mkdir(parents=True, exist_ok=True)
     shutil.copytree(sparse_src, sparse_dst, dirs_exist_ok=True)
+    filter_sparse_images_txt(sparse_dst, sync_data["heatmap_matches"])
     images_dst.mkdir(parents=True, exist_ok=True)
 
     for image_name, heatmap_path in sync_data["heatmap_matches"].items():
@@ -794,15 +847,13 @@ def apply_heatmaps_to_mesh(
     keep_workspace=False,
     heatmap_alpha=DEFAULT_HEATMAP_ALPHA,
     heatmap_only=False,
+    warn_on_partial=True,
 ):
     """Validate heatmaps and texture the mesh with COLMAP mesh_texturer."""
     sync_data = load_sync_data(colmap_output, heatmap_folder, mesh_path)
-    missing_heatmaps = sync_data["missing_heatmaps"]
-    if missing_heatmaps:
-        raise ValueError("Some COLMAP images do not have matching heatmaps.")
-
-    if len(sync_data["heatmap_matches"]) != len(sync_data["images"]):
-        raise ValueError("Heatmap matching did not cover every COLMAP image.")
+    require_heatmap_matches(sync_data)
+    if warn_on_partial:
+        warn_partial_heatmap_matches(sync_data)
 
     output_dir = Path(output_dir) if output_dir is not None else colmap_output / "heatmapped_mesh"
     temp_root = Path(tempfile.mkdtemp(prefix="heatmap_texturing_"))
@@ -853,6 +904,7 @@ def project_heatmaps(
     heatmap_global_blur_grid_divisions=DEFAULT_HEATMAP_GLOBAL_BLUR_GRID_DIVISIONS,
     heatmap_smooth_iterations=DEFAULT_HEATMAP_SMOOTH_ITERATIONS,
     heatmap_smooth_strength=DEFAULT_HEATMAP_SMOOTH_STRENGTH,
+    warn_on_partial=True,
 ):
     """Project heatmaps onto a reconstructed mesh and return structured outputs."""
     if method not in {"vertex-colors", "mesh-texturer"}:
@@ -877,6 +929,7 @@ def project_heatmaps(
             heatmap_global_blur_grid_divisions=heatmap_global_blur_grid_divisions,
             heatmap_smooth_iterations=heatmap_smooth_iterations,
             heatmap_smooth_strength=heatmap_smooth_strength,
+            warn_on_partial=warn_on_partial,
         )
         return HeatmapProjectionResult(
             reconstruction=reconstruction,
@@ -899,6 +952,7 @@ def project_heatmaps(
         keep_workspace=keep_workspace,
         heatmap_alpha=heatmap_alpha,
         heatmap_only=heatmap_only,
+        warn_on_partial=warn_on_partial,
     )
     return HeatmapProjectionResult(
         reconstruction=reconstruction,
@@ -1006,6 +1060,18 @@ def main():
     print_name_list("Missing heatmap files", missing_heatmaps)
     print_name_list("Extra heatmap files", extra_heatmaps)
 
+    try:
+        require_heatmap_matches(sync_data)
+    except ValueError as error:
+        if not sync_data["image_name_map_path"]:
+            print(
+                "Hint: If COLMAP renamed your source images, rerun colmap-orchestrate "
+                "to create image_name_map.csv in the output folder.",
+                file=sys.stderr,
+            )
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
     if missing_heatmaps:
         if not sync_data["image_name_map_path"]:
             print(
@@ -1013,8 +1079,7 @@ def main():
                 "to create image_name_map.csv in the output folder.",
                 file=sys.stderr,
             )
-        print("Error: Some COLMAP images do not have matching heatmaps.", file=sys.stderr)
-        sys.exit(1)
+        warn_partial_heatmap_matches(sync_data)
 
     if args.validate_only:
         return
@@ -1045,6 +1110,7 @@ def main():
                 mesh_path=args.mesh,
                 heatmap_alpha=args.heatmap_alpha,
                 heatmap_only=args.heatmap_only,
+                warn_on_partial=False,
             )
         except (FileNotFoundError, RuntimeError, ValueError, ImportError) as error:
             print(f"Error: {error}", file=sys.stderr)
@@ -1074,6 +1140,7 @@ def main():
             keep_workspace=args.keep_workspace,
             heatmap_alpha=args.heatmap_alpha,
             heatmap_only=args.heatmap_only,
+            warn_on_partial=False,
         )
     except (FileNotFoundError, RuntimeError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
