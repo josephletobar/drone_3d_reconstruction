@@ -17,6 +17,7 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOCAL_COLMAP = PROJECT_ROOT / "tools" / "colmap" / "COLMAP.bat"
 DEFAULT_MAX_IMAGE_SIZE = 640
+PATCH_MATCH_STEREO_NUM_ITERATIONS = 2
 
 
 @dataclass(frozen=True)
@@ -314,7 +315,7 @@ def run_colmap_dense(
         "--workspace_format", "COLMAP",
         "--PatchMatchStereo.gpu_index", "0",
         "--PatchMatchStereo.geom_consistency", "true",
-        "--PatchMatchStereo.num_iterations", "1",
+        "--PatchMatchStereo.num_iterations", str(PATCH_MATCH_STEREO_NUM_ITERATIONS),
     ]
     print("Running stereo matching...")
     try:
