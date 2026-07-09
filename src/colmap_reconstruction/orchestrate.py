@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOCAL_COLMAP = PROJECT_ROOT / "tools" / "colmap" / "COLMAP.bat"
 DEFAULT_MAX_IMAGE_SIZE = 640
 PATCH_MATCH_STEREO_NUM_ITERATIONS = 2
+DEFAULT_GEOREF_ALIGNMENT_MAX_ERROR = 50.0
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,10 @@ class ReconstructionResult:
     artifact_paths: tuple[Path, ...]
     frame_count: int
     dense: bool
+    georeferenced: bool = False
+    georef_csv_path: Path | None = None
+    georef_reference_path: Path | None = None
+    georef_transform_path: Path | None = None
 
     @classmethod
     def from_output_dir(
@@ -43,10 +48,14 @@ class ReconstructionResult:
         dense=True,
         artifact_paths=(),
         frame_count=0,
+        georeferenced=False,
+        georef_csv_path=None,
     ):
         """Build a result object for an existing reconstruction output folder."""
         output_dir = Path(output_dir)
         image_name_map_path = output_dir / "image_name_map.csv"
+        georef_reference_path = output_dir / "georef_reference.txt"
+        georef_transform_path = output_dir / "georef_transform.txt"
         return cls(
             input_path=Path(input_path) if input_path is not None else None,
             output_dir=output_dir,
@@ -59,6 +68,14 @@ class ReconstructionResult:
             artifact_paths=tuple(Path(path) for path in artifact_paths),
             frame_count=frame_count,
             dense=dense,
+            georeferenced=georeferenced or georef_reference_path.exists(),
+            georef_csv_path=Path(georef_csv_path) if georef_csv_path is not None else None,
+            georef_reference_path=(
+                georef_reference_path if georef_reference_path.exists() else None
+            ),
+            georef_transform_path=(
+                georef_transform_path if georef_transform_path.exists() else None
+            ),
         )
 
 
@@ -161,6 +178,122 @@ def write_image_name_map(manifest_path, rows):
         )
         writer.writeheader()
         writer.writerows(rows)
+
+
+def read_image_name_map(manifest_path):
+    """Read the source-to-COLMAP staged image filename map."""
+    manifest_path = Path(manifest_path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Image name map not found: {manifest_path}")
+
+    with manifest_path.open("r", newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        required_columns = {"original_name", "staged_name"}
+        if not required_columns.issubset(reader.fieldnames or []):
+            raise ValueError(
+                f"Invalid image name map: {manifest_path} must include "
+                "original_name and staged_name columns"
+            )
+        return list(reader)
+
+
+def load_georef_positions(georef_csv):
+    """Read image camera centers from a query.csv-style georeference file."""
+    georef_csv = Path(georef_csv)
+    if not georef_csv.exists():
+        raise FileNotFoundError(f"Georeference CSV not found: {georef_csv}")
+
+    positions = {}
+    lower_positions = {}
+    with georef_csv.open("r", newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        required_columns = {"name", "easting", "northing", "altitude"}
+        if not required_columns.issubset(reader.fieldnames or []):
+            missing = ", ".join(sorted(required_columns - set(reader.fieldnames or [])))
+            raise ValueError(
+                f"Invalid georeference CSV: {georef_csv} is missing required "
+                f"column(s): {missing}"
+            )
+
+        for row_number, row in enumerate(reader, start=2):
+            image_name = row["name"].strip()
+            if not image_name:
+                raise ValueError(f"Missing image name in georeference CSV row {row_number}")
+            if image_name in positions:
+                raise ValueError(
+                    f"Duplicate image name in georeference CSV row {row_number}: "
+                    f"{image_name}"
+                )
+
+            try:
+                position = (
+                    float(row["easting"]),
+                    float(row["northing"]),
+                    float(row["altitude"]),
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid georeference coordinate in row {row_number}: {row}"
+                ) from error
+
+            positions[image_name] = position
+            lower_positions.setdefault(image_name.lower(), position)
+
+    return positions, lower_positions
+
+
+def build_georef_reference_file(
+    georef_csv,
+    image_name_map_path,
+    reference_path,
+    min_matches=3,
+):
+    """
+    Write a COLMAP model_aligner reference file from query.csv and image_name_map.csv.
+
+    The output uses staged COLMAP image names with easting/northing/altitude values:
+    image_000001.png 498224.607 4433452.523 530.817
+    """
+    reference_path = Path(reference_path)
+    if reference_path.exists():
+        reference_path.unlink()
+
+    positions, lower_positions = load_georef_positions(georef_csv)
+    image_name_rows = read_image_name_map(image_name_map_path)
+
+    reference_rows = []
+    missing_original_names = []
+    for row in image_name_rows:
+        original_name = row["original_name"].strip()
+        staged_name = row["staged_name"].strip()
+        if not original_name or not staged_name:
+            continue
+
+        position = positions.get(original_name)
+        if position is None:
+            position = lower_positions.get(original_name.lower())
+        if position is None:
+            missing_original_names.append(original_name)
+            continue
+
+        reference_rows.append((staged_name, *position))
+
+    if len(reference_rows) < min_matches:
+        raise ValueError(
+            "Georeferencing requires at least "
+            f"{min_matches} images matched between the input folder and CSV, "
+            f"but only found {len(reference_rows)}."
+        )
+
+    reference_path.parent.mkdir(parents=True, exist_ok=True)
+    with reference_path.open("w", encoding="utf-8", newline="\n") as file:
+        for staged_name, easting, northing, altitude in reference_rows:
+            file.write(
+                f"{staged_name} {easting:.17g} {northing:.17g} {altitude:.17g}\n"
+            )
+
+    return reference_path, len(reference_rows), missing_original_names
+
 
 def extract_frames(
     video_file,
@@ -291,7 +424,9 @@ def run_colmap_dense(
 ):
     """Run COLMAP dense reconstruction pipeline."""
     dense_dir = workspace_dir / "dense"
-    sparse_model = workspace_dir / "sparse" / "0"
+    sparse_model = find_sparse_model_dir(workspace_dir)
+    if sparse_model is None:
+        raise RuntimeError("Dense reconstruction failed: no sparse model found")
 
     # Step 1: Image undistortion
     cmd = [
@@ -339,6 +474,72 @@ def run_colmap_dense(
         raise RuntimeError(f"Stereo fusion failed: {e}")
 
     return output_ply
+
+
+def run_colmap_model_aligner(
+    workspace_dir,
+    reference_path,
+    transform_path,
+    alignment_max_error=DEFAULT_GEOREF_ALIGNMENT_MAX_ERROR,
+):
+    """Align the sparse model into the custom easting/northing/altitude frame."""
+    if alignment_max_error <= 0:
+        raise ValueError("Georeference alignment max error must be greater than 0")
+
+    sparse_model_dir = find_sparse_model_dir(workspace_dir)
+    if sparse_model_dir is None:
+        raise RuntimeError("Georeferencing failed: no sparse model found")
+
+    aligned_model_dir = workspace_dir / "sparse_aligned"
+    if aligned_model_dir.exists():
+        shutil.rmtree(aligned_model_dir)
+    aligned_model_dir.mkdir(parents=True, exist_ok=True)
+
+    transform_path = Path(transform_path)
+    transform_path.parent.mkdir(parents=True, exist_ok=True)
+    if transform_path.exists():
+        transform_path.unlink()
+
+    print("Aligning sparse reconstruction to georeference CSV...")
+    cmd = [
+        colmap_command(),
+        "model_aligner",
+        "--input_path",
+        str(sparse_model_dir),
+        "--output_path",
+        str(aligned_model_dir),
+        "--ref_images_path",
+        str(reference_path),
+        "--ref_is_gps",
+        "0",
+        "--alignment_type",
+        "custom",
+        "--min_common_images",
+        "3",
+        "--alignment_max_error",
+        str(alignment_max_error),
+        "--transform_path",
+        str(transform_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Georeferencing failed: {e}")
+
+    if not has_sparse_model_files(aligned_model_dir):
+        raise RuntimeError(
+            f"Georeferencing failed: aligned model files not found in {aligned_model_dir}"
+        )
+    if not transform_path.exists():
+        raise RuntimeError(
+            f"Georeferencing failed: transform file was not written: {transform_path}"
+        )
+
+    if sparse_model_dir.exists():
+        shutil.rmtree(sparse_model_dir)
+    shutil.copytree(aligned_model_dir, sparse_model_dir)
+    return sparse_model_dir
+
 
 def run_colmap_poisson_mesher(point_cloud_path, output_mesh_path, depth=10):
     """Convert point cloud to mesh using COLMAP's Poisson mesher."""
@@ -444,6 +645,8 @@ def reconstruct(
     frames_dir=None,
     verbose=True,
     dense=True,
+    georef_csv=None,
+    georef_alignment_max_error=DEFAULT_GEOREF_ALIGNMENT_MAX_ERROR,
 ):
     """
     Run full COLMAP pipeline from one video, a video folder, or an image-frame folder.
@@ -457,6 +660,8 @@ def reconstruct(
         frames_dir: Override temp frames directory
         verbose: Print progress messages
         dense: If False, sparse only (default True for dense reconstruction + meshing)
+        georef_csv: Optional query.csv-style file with name/easting/northing/altitude
+        georef_alignment_max_error: Max model_aligner error in CSV coordinate units
 
     Returns:
         ReconstructionResult with output paths and run metadata
@@ -468,6 +673,8 @@ def reconstruct(
     pipeline_start = time.perf_counter()
     input_path = Path(input_path)
     output_dir = Path(output_dir)
+    georef_csv_path = Path(georef_csv) if georef_csv is not None else None
+    georef_alignment_max_error = float(georef_alignment_max_error)
 
     temp_root = None
     if workspace_dir is None or frames_dir is None:
@@ -486,6 +693,10 @@ def reconstruct(
     # Validate inputs
     if not input_path.exists():
         raise ValueError(f"Input path '{input_path}' does not exist")
+    if georef_csv_path is not None and not georef_csv_path.exists():
+        raise ValueError(f"Georeference CSV '{georef_csv_path}' does not exist")
+    if georef_csv_path is not None and georef_alignment_max_error <= 0:
+        raise ValueError("Georeference alignment max error must be greater than 0")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -505,6 +716,12 @@ def reconstruct(
             f"Supported image extensions: {image_extensions}"
         )
 
+    if georef_csv_path is not None and not is_image_folder_input:
+        raise ValueError(
+            "Georeferencing with --georef-csv is only supported for image-frame "
+            "folder inputs because the CSV name column must match source image files."
+        )
+
     if verbose:
         if is_video_input:
             print(f"Found video input: {input_path}")
@@ -515,6 +732,10 @@ def reconstruct(
 
     try:
         num_frames = 0
+        image_name_map_path = output_dir / "image_name_map.csv"
+        georeferenced = False
+        georef_reference_path = None
+        georef_transform_path = None
 
         if is_image_folder_input:
             if verbose:
@@ -527,7 +748,7 @@ def reconstruct(
                 frames_dir,
                 skip_frames,
                 max_image_size=max_image_size,
-                manifest_path=output_dir / "image_name_map.csv",
+                manifest_path=image_name_map_path,
             )
 
         if is_video_input or is_video_folder_input:
@@ -550,10 +771,39 @@ def reconstruct(
         if verbose:
             print(f"Prepared {num_frames} image(s) for reconstruction")
 
+        if georef_csv_path is not None:
+            georef_reference_path = output_dir / "georef_reference.txt"
+            georef_transform_path = output_dir / "georef_transform.txt"
+            georef_reference_path, matched_count, missing_names = build_georef_reference_file(
+                georef_csv_path,
+                image_name_map_path,
+                georef_reference_path,
+            )
+            if verbose:
+                print(
+                    f"Prepared georeference positions for {matched_count} staged image(s)"
+                )
+                if missing_names:
+                    print(
+                        "Warning: "
+                        f"{len(missing_names)} staged image(s) had no georeference row"
+                    )
+
         # Run COLMAP pipeline
         print("\n--- Starting sparse reconstruction ---")
         run_colmap_sparse(frames_dir, workspace_dir)
         print("Sparse reconstruction complete\n")
+
+        if georef_reference_path is not None:
+            print("--- Starting sparse georeferencing ---")
+            run_colmap_model_aligner(
+                workspace_dir,
+                georef_reference_path,
+                georef_transform_path,
+                alignment_max_error=georef_alignment_max_error,
+            )
+            georeferenced = True
+            print("Sparse georeferencing complete\n")
 
         # Optional dense reconstruction
         if dense:
@@ -601,8 +851,10 @@ def reconstruct(
             if verbose:
                 print(f"Success! Point cloud saved to {final_output}")
 
-        artifact_paths = save_colmap_artifacts(workspace_dir, output_dir, verbose)
-        image_name_map_path = output_dir / "image_name_map.csv"
+        artifact_paths = list(save_colmap_artifacts(workspace_dir, output_dir, verbose))
+        for georef_artifact in (georef_reference_path, georef_transform_path):
+            if georef_artifact is not None and Path(georef_artifact).exists():
+                artifact_paths.append(Path(georef_artifact))
 
         return ReconstructionResult(
             input_path=input_path,
@@ -616,6 +868,18 @@ def reconstruct(
             artifact_paths=tuple(artifact_paths),
             frame_count=num_frames,
             dense=dense,
+            georeferenced=georeferenced,
+            georef_csv_path=georef_csv_path,
+            georef_reference_path=(
+                georef_reference_path
+                if georef_reference_path is not None and Path(georef_reference_path).exists()
+                else None
+            ),
+            georef_transform_path=(
+                georef_transform_path
+                if georef_transform_path is not None and Path(georef_transform_path).exists()
+                else None
+            ),
         )
 
     except Exception as e:
@@ -646,6 +910,8 @@ def orchestrate(
     frames_dir=None,
     verbose=True,
     dense=True,
+    georef_csv=None,
+    georef_alignment_max_error=DEFAULT_GEOREF_ALIGNMENT_MAX_ERROR,
 ):
     """
     Compatibility wrapper for the older path-returning API.
@@ -661,6 +927,8 @@ def orchestrate(
         frames_dir=frames_dir,
         verbose=verbose,
         dense=dense,
+        georef_csv=georef_csv,
+        georef_alignment_max_error=georef_alignment_max_error,
     )
     return result.mesh_path
 
@@ -690,6 +958,24 @@ def main():
             f"pixels. Defaults to {DEFAULT_MAX_IMAGE_SIZE}"
         ),
     )
+    parser.add_argument(
+        "--georef-csv",
+        "--gps-csv",
+        dest="georef_csv",
+        help=(
+            "Optional query.csv-style file with name,easting,northing,altitude "
+            "columns. Supported for image-frame folder inputs only."
+        ),
+    )
+    parser.add_argument(
+        "--georef-alignment-max-error",
+        type=float,
+        default=DEFAULT_GEOREF_ALIGNMENT_MAX_ERROR,
+        help=(
+            "Maximum COLMAP model_aligner error in CSV coordinate units. "
+            f"Defaults to {DEFAULT_GEOREF_ALIGNMENT_MAX_ERROR:g}."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -698,8 +984,13 @@ def main():
             args.output_folder,
             skip_frames=args.skip_frames,
             max_image_size=args.max_image_size,
+            georef_csv=args.georef_csv,
+            georef_alignment_max_error=args.georef_alignment_max_error,
         )
         print(f"Mesh output: {result.mesh_path}")
+        if result.georeferenced:
+            print(f"Georeference reference: {result.georef_reference_path}")
+            print(f"Georeference transform: {result.georef_transform_path}")
     except (ValueError, RuntimeError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

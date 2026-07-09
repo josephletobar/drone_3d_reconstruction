@@ -85,6 +85,8 @@ ffmpeg are still runtime requirements.
 |------|---------|---------|
 | `--skip-frames N` | For video input, sample every Nth frame | `0` = all frames |
 | `--max-image-size N` | Resize prepared images so the longest edge is at most N pixels | `640` |
+| `--georef-csv PATH` | Georeference image-folder reconstructions from `name,easting,northing,altitude` CSV | disabled |
+| `--georef-alignment-max-error N` | Maximum COLMAP alignment error in CSV coordinate units | `50` |
 
 For image-frame folder input, `--skip-frames N` samples every Nth image.
 `--max-image-size N` preserves aspect ratio for landscape, portrait, and square
@@ -95,6 +97,19 @@ inputs by scaling the longest edge.
 > has redundant high framerate footage.
 > Likewise, start with the default `--max-image-size 640`; increase to 768 or
 > 1024 only if the reconstruction is too sparse or loses detail.
+
+## Georeferenced Reconstruction
+
+For image-frame folders with a `query.csv`-style metadata file, pass
+`--georef-csv` to align the sparse reconstruction before dense reconstruction:
+
+```powershell
+colmap-orchestrate C:\path\to\image_frames C:\path\to\output --georef-csv C:\path\to\query.csv
+```
+
+The CSV must include `name`, `easting`, `northing`, and `altitude` columns.
+Image names are matched through `image_name_map.csv`, so the final dense cloud,
+mesh, and saved sparse model are written in the CSV coordinate frame.
 
 ## Output
 
@@ -125,4 +140,3 @@ from colmap_reconstruction import project_heatmaps
 heatmap_result = project_heatmaps(reconstruction, "/path/to/heatmaps")
 print(heatmap_result.output_mesh_path)
 ```
-
