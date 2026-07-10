@@ -121,6 +121,34 @@ Intermediate files are automatically cleaned up.
 
 Open the `.ply` file in CloudCompare, MeshLab, or another PLY viewer.
 
+## Interactive Heatmap Painting
+
+Open any PLY in the desktop painter:
+
+```powershell
+colmap-paint-heatmap C:\path\to\mesh.ply
+```
+
+The painter always treats the colors already in the PLY as the base, whether
+they came from reconstruction, projected heatmaps, or earlier painting. Press
+Use the on-screen heat slider to choose a color from the OpenCV JET scale, then
+press `P` to paint. `X` erases toward the colors present when the file was
+opened, and `N` navigates the camera. Left-drag applies the selected brush. Use
+`-` and `=` for brush size, `U` to undo the last stroke, `C` to clear all
+current-session painting, and `S` to save a new PLY copy.
+The brush has a feathered radial edge, and repeated strokes are capped at 55%
+overlay opacity so the mesh imagery remains visible. Override that ceiling with
+`--max-overlay-opacity` when launching the painter.
+The input file is never overwritten automatically.
+
+From Python:
+
+```python
+from colmap_reconstruction import paint_heatmap
+
+paint_heatmap("/path/to/mesh.ply")
+```
+
 **Example:**
 <img width="1285" height="809" alt="image" src="https://github.com/user-attachments/assets/9e4aa971-a5f4-4950-8b0e-e6775a34a076" />
 
@@ -139,4 +167,31 @@ from colmap_reconstruction import project_heatmaps
 
 heatmap_result = project_heatmaps(reconstruction, "/path/to/heatmaps")
 print(heatmap_result.output_mesh_path)
+```
+
+## Object Pins
+
+After a georeferenced reconstruction, project object nodes from a saved
+`graph.db` onto the mesh:
+
+```powershell
+colmap-object-pins C:\path\to\colmap_output C:\path\to\graph.db
+```
+
+This reads the base `nodes` table and writes outputs under
+`colmap_output\object_pins`:
+
+- `object_pins.csv` - graph node `x/y` positions with nearest-mesh height plus a small vertical offset
+- `object_pins_on_mesh.ply` - the heatmapped mesh, when available, with colored object pins appended into the same PLY
+- `leveled_reconstruction.ply` - the reconstruction leveled by correcting `z` while preserving geospatial `x/y`
+- `object_pins_on_mesh_leveled.ply` - the leveled reconstruction with object pins placed using the same `geo_pos_x/y` logic
+- `object_pins_level_transform.txt` - the vertical leveling transform applied to the reconstruction
+
+From Python:
+
+```python
+from colmap_reconstruction import project_object_pins
+
+pin_result = project_object_pins(reconstruction, "/path/to/graph.db")
+print(pin_result.output_mesh_path)
 ```

@@ -12,11 +12,14 @@ dependencies = [
     "tqdm>=4.66",
     "pillow",
     "numpy",
+    "pyvista>=0.46",
 ]
 
 [project.scripts]
 colmap-orchestrate = "colmap_reconstruction.orchestrate:main"
 colmap-heatmaps = "colmap_reconstruction.apply_heatmaps:main"
+colmap-object-pins = "colmap_reconstruction.object_pins:main"
+colmap-paint-heatmap = "colmap_reconstruction.paint_heatmap:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
