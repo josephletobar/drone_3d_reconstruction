@@ -634,7 +634,7 @@ def level_base_mesh(vertices):
 
 
 def project_object_pins(reconstruction, graph_db):
-    """Project graph.db object nodes onto a georeferenced reconstructed mesh."""
+    """Add graph.db object pins to a reconstructed mesh."""
     if not isinstance(reconstruction, ReconstructionResult):
         raise TypeError("reconstruction must be a ReconstructionResult")
 
@@ -766,7 +766,7 @@ def project_object_pins(reconstruction, graph_db):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Project graph.db object nodes onto a georeferenced COLMAP mesh."
+        description="Add graph.db object pins to an associated COLMAP mesh."
     )
     parser.add_argument("colmap_output", help="Path to a completed COLMAP output folder")
     parser.add_argument("graph_db", help="Path to graph.db from priority_map")

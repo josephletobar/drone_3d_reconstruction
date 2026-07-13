@@ -121,51 +121,9 @@ Intermediate files are automatically cleaned up.
 
 Open the `.ply` file in CloudCompare, MeshLab, or another PLY viewer.
 
-## Interactive Heatmap Painting
-
-Open any PLY in the desktop painter:
-
-```powershell
-colmap-paint-heatmap C:\path\to\mesh.ply
-```
-
-The painter always treats the colors already in the PLY as the base, whether
-they came from reconstruction, projected heatmaps, or earlier painting. Press
-Use the on-screen heat slider to choose a color from the OpenCV JET scale, then
-press `P` to paint. `X` erases toward the colors present when the file was
-opened, and `N` navigates the camera. Left-drag applies the selected brush. Use
-`-` and `=` for brush size, `U` to undo the last stroke, `C` to clear all
-current-session painting, and `S` to save a new PLY copy.
-The brush has a feathered radial edge, and repeated strokes are capped at 55%
-overlay opacity so the mesh imagery remains visible. Override that ceiling with
-`--max-overlay-opacity` when launching the painter.
-The input file is never overwritten automatically.
-
-From Python:
-
-```python
-from colmap_reconstruction import paint_heatmap
-
-paint_heatmap("/path/to/mesh.ply")
-```
-
-To synchronize painting with Priority Map, open a pin-augmented mesh together
-with its database:
-
-```powershell
-colmap-paint-heatmap C:\path\to\object_pins_on_mesh.ply C:\path\to\graph.db
-```
-
-At the end of each stroke, the painter groups touched surface vertices by their
-embedded node ID. For every node with a pin, it takes the median visible RGB,
-recolors the pin, writes that RGB to the base `nodes` table, and converts the
-nearest OpenCV JET color to a `0`-`100` priority score. `U` restores mesh, pin,
-and database state for the previous stroke; `C` restores the database state
-from when the session opened. Database writes are immediate, while saving the
-painted PLY remains explicit.
-
 **Example:**
 <img width="1285" height="809" alt="image" src="https://github.com/user-attachments/assets/9e4aa971-a5f4-4950-8b0e-e6775a34a076" />
+
 
 ## Heatmap Projection
 
@@ -205,8 +163,8 @@ object-pin/leveling outputs preserve the association data.
 
 ## Object Pins
 
-After a georeferenced reconstruction, project object nodes from a saved
-`graph.db` onto the mesh:
+Add pins for object nodes from a saved `graph.db` to a reconstructed mesh that
+contains embedded vertex-to-node associations:
 
 ```powershell
 colmap-object-pins C:\path\to\colmap_output C:\path\to\graph.db
@@ -215,18 +173,16 @@ colmap-object-pins C:\path\to\colmap_output C:\path\to\graph.db
 This reads the base `nodes` table and writes outputs under
 `colmap_output\object_pins`:
 
-When the preferred PLY contains embedded node associations, vertices are
-grouped by exact node ID and one pin is placed near each group's 3D median.
-This avoids creating one marker per vertex and does not rely on graph XY
-coordinates. For older PLY files without associations, placement falls back to
-the graph node's `geo_pos_x/y` and nearest mesh height.
-Generated marker vertices also receive a `pin_node_index` property so the
-interactive painter can recolor the correct pin when its graph node changes.
+Vertices are grouped by exact node ID and one pin is placed near each group's
+3D median. The associations, rather than heatmap coloring or georeferencing,
+connect regions of the mesh to database nodes. Generated marker vertices also
+receive a `pin_node_index` property so the interactive painter can recolor the
+correct pin when its graph node changes.
 
-- `object_pins.csv` - graph node `x/y` positions with nearest-mesh height plus a small vertical offset
-- `object_pins_on_mesh.ply` - the heatmapped mesh, when available, with colored object pins appended into the same PLY
-- `leveled_reconstruction.ply` - the reconstruction leveled by correcting `z` while preserving geospatial `x/y`
-- `object_pins_on_mesh_leveled.ply` - the leveled reconstruction with object pins placed using the same `geo_pos_x/y` logic
+- `object_pins.csv` - object pin IDs, colors, and 3D positions derived from their associated mesh regions
+- `object_pins_on_mesh.ply` - the associated mesh with colored object pins appended into the same PLY
+- `leveled_reconstruction.ply` - the reconstruction leveled by correcting `z` while preserving its `x/y` coordinates
+- `object_pins_on_mesh_leveled.ply` - the leveled reconstruction with pins placed from the same vertex-to-node associations
 - `object_pins_level_transform.txt` - the vertical leveling transform applied to the reconstruction
 
 From Python:
@@ -237,3 +193,47 @@ from colmap_reconstruction import project_object_pins
 pin_result = project_object_pins(reconstruction, "/path/to/graph.db")
 print(pin_result.output_mesh_path)
 ```
+## Interactive Heatmap Painting
+
+For visual-only painting, open any PLY in the desktop painter:
+
+```powershell
+colmap-paint-heatmap C:\path\to\mesh.ply
+```
+
+To also recolor object pins and update Priority Map, pass a pinned PLY containing
+embedded node associations together with its database:
+
+```powershell
+colmap-paint-heatmap C:\path\to\object_pins_on_mesh.ply C:\path\to\graph.db
+```
+
+The painter always treats the colors already in the PLY as the base, whether
+they came from reconstruction, projected heatmaps, or earlier painting. Use
+the on-screen heat slider to choose a color from the OpenCV JET scale, then
+press `P` to paint. `X` erases toward the colors present when the file was
+opened, and `N` navigates the camera. Left-drag applies the selected brush. Use
+`-` and `=` for brush size, `U` to undo the last stroke, `C` to clear all
+current-session painting, and `S` to save a new PLY copy.
+The brush has a feathered radial edge, and repeated strokes are capped at 55%
+overlay opacity so the mesh imagery remains visible. Override that ceiling with
+`--max-overlay-opacity` when launching the painter.
+The input file is never overwritten automatically.
+
+From Python:
+
+```python
+from colmap_reconstruction import paint_heatmap
+
+paint_heatmap("/path/to/mesh.ply")
+paint_heatmap("/path/to/object_pins_on_mesh.ply", graph_db="/path/to/graph.db")
+```
+
+With a database supplied, the painter groups touched surface vertices by their
+embedded node ID at the end of each stroke. For every node with a pin, it takes
+the median visible RGB, recolors the pin, writes that RGB to the base `nodes`
+table, and converts the nearest OpenCV JET color to a `0`-`100` priority score.
+`U` restores mesh, pin, and database state for the previous stroke; `C` restores
+the database state from when the session opened. Database writes are immediate,
+while saving the painted PLY remains explicit. Without a database, painting is
+visual only.
