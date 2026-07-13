@@ -149,6 +149,21 @@ from colmap_reconstruction import paint_heatmap
 paint_heatmap("/path/to/mesh.ply")
 ```
 
+To synchronize painting with Priority Map, open a pin-augmented mesh together
+with its database:
+
+```powershell
+colmap-paint-heatmap C:\path\to\object_pins_on_mesh.ply C:\path\to\graph.db
+```
+
+At the end of each stroke, the painter groups touched surface vertices by their
+embedded node ID. For every node with a pin, it takes the median visible RGB,
+recolors the pin, writes that RGB to the base `nodes` table, and converts the
+nearest OpenCV JET color to a `0`-`100` priority score. `U` restores mesh, pin,
+and database state for the previous stroke; `C` restores the database state
+from when the session opened. Database writes are immediate, while saving the
+painted PLY remains explicit.
+
 **Example:**
 <img width="1285" height="809" alt="image" src="https://github.com/user-attachments/assets/9e4aa971-a5f4-4950-8b0e-e6775a34a076" />
 
@@ -169,6 +184,25 @@ heatmap_result = project_heatmaps(reconstruction, "/path/to/heatmaps")
 print(heatmap_result.output_mesh_path)
 ```
 
+When Priority Map writes a matching ownership file beside a heatmap image,
+vertex-color projection also embeds the exact graph node ID into the output
+PLY:
+
+```text
+000427.png
+000427.nodes.npz   # contains a 2D string array named node_ids
+```
+
+The PNG supplies the projected RGB value and `node_ids` is sampled at the same
+pixel. Missing ownership files do not block projection; affected vertices are
+left unassociated. Malformed ownership files fail with a validation error.
+
+The self-contained PLY stores an integer `node_index` on each vertex (`-1`
+means no node) and a `node_label` lookup element containing the exact UTF-8
+IDs, such as `buildings_0`. Generic PLY viewers may ignore these custom fields
+while continuing to display the mesh normally. The interactive painter and
+object-pin/leveling outputs preserve the association data.
+
 ## Object Pins
 
 After a georeferenced reconstruction, project object nodes from a saved
@@ -180,6 +214,14 @@ colmap-object-pins C:\path\to\colmap_output C:\path\to\graph.db
 
 This reads the base `nodes` table and writes outputs under
 `colmap_output\object_pins`:
+
+When the preferred PLY contains embedded node associations, vertices are
+grouped by exact node ID and one pin is placed near each group's 3D median.
+This avoids creating one marker per vertex and does not rely on graph XY
+coordinates. For older PLY files without associations, placement falls back to
+the graph node's `geo_pos_x/y` and nearest mesh height.
+Generated marker vertices also receive a `pin_node_index` property so the
+interactive painter can recolor the correct pin when its graph node changes.
 
 - `object_pins.csv` - graph node `x/y` positions with nearest-mesh height plus a small vertical offset
 - `object_pins_on_mesh.ply` - the heatmapped mesh, when available, with colored object pins appended into the same PLY

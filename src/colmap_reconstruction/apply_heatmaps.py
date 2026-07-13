@@ -58,6 +58,8 @@ class HeatmapProjectionResult:
     extra_heatmaps: tuple[str, ...]
     assigned_vertices: int | None
     total_vertices: int | None
+    associated_vertices: int | None = None
+    associated_nodes: int | None = None
 
 
 def colmap_command():
@@ -521,8 +523,65 @@ def read_ply_mesh(path):
     return np.asarray(vertices, dtype=np.float64), faces
 
 
-def write_colored_ply(path, vertices, faces, colors):
-    """Write an ASCII PLY with per-vertex RGB colors."""
+def _normalize_node_lookup(node_ids):
+    if node_ids is None:
+        return {}
+    if isinstance(node_ids, dict):
+        lookup = {int(index): str(node_id) for index, node_id in node_ids.items()}
+    else:
+        lookup = {index: str(node_id) for index, node_id in enumerate(node_ids)}
+    if any(index < 0 for index in lookup):
+        raise ValueError("Node lookup indices must be non-negative")
+    if any(not node_id for node_id in lookup.values()):
+        raise ValueError("Node IDs in the PLY lookup must not be empty")
+    return lookup
+
+
+def write_colored_ply(
+    path,
+    vertices,
+    faces,
+    colors,
+    node_indices=None,
+    node_ids=None,
+    pin_node_indices=None,
+):
+    """Write an ASCII PLY with RGB colors and optional per-vertex node IDs."""
+    import numpy as np
+
+    lookup = _normalize_node_lookup(node_ids)
+    if node_indices is None:
+        indices = None
+    else:
+        indices = np.asarray(node_indices, dtype=np.int32)
+        if indices.shape != (len(vertices),):
+            raise ValueError("node_indices must contain exactly one value per vertex")
+        if np.any(indices < -1):
+            raise ValueError("node_indices may only use -1 for unassigned vertices")
+        referenced = {int(index) for index in np.unique(indices) if int(index) >= 0}
+        missing = sorted(referenced - set(lookup))
+        if missing:
+            raise ValueError(f"Node lookup is missing index/indices: {missing}")
+
+    if pin_node_indices is None:
+        pin_indices = None
+    else:
+        pin_indices = np.asarray(pin_node_indices, dtype=np.int32)
+        if pin_indices.shape != (len(vertices),):
+            raise ValueError("pin_node_indices must contain exactly one value per vertex")
+        if np.any(pin_indices < -1):
+            raise ValueError("pin_node_indices may only use -1 for non-pin vertices")
+        referenced = {int(index) for index in np.unique(pin_indices) if int(index) >= 0}
+        missing = sorted(referenced - set(lookup))
+        if missing:
+            raise ValueError(f"Node lookup is missing pin index/indices: {missing}")
+
+    has_node_metadata = indices is not None or pin_indices is not None
+    if lookup and not has_node_metadata:
+        raise ValueError(
+            "node_indices or pin_node_indices are required when node_ids are provided"
+        )
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="ascii", newline="\n") as file:
         file.write("ply\n")
@@ -534,17 +593,83 @@ def write_colored_ply(path, vertices, faces, colors):
         file.write("property uchar red\n")
         file.write("property uchar green\n")
         file.write("property uchar blue\n")
+        if indices is not None:
+            file.write("property int node_index\n")
+        if pin_indices is not None:
+            file.write("property int pin_node_index\n")
         file.write(f"element face {len(faces)}\n")
         file.write("property list uchar int vertex_indices\n")
+        if has_node_metadata:
+            file.write(f"element node_label {len(lookup)}\n")
+            file.write("property int index\n")
+            file.write("property list uint uchar node_id\n")
         file.write("end_header\n")
-        for vertex, color in zip(vertices, colors):
-            file.write(
+        for vertex_index, (vertex, color) in enumerate(zip(vertices, colors)):
+            line = (
                 f"{vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g} "
-                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+                f"{int(color[0])} {int(color[1])} {int(color[2])}"
             )
+            if indices is not None:
+                line += f" {int(indices[vertex_index])}"
+            if pin_indices is not None:
+                line += f" {int(pin_indices[vertex_index])}"
+            file.write(line + "\n")
         for face in faces:
             indices = " ".join(str(int(index)) for index in face)
             file.write(f"{len(face)} {indices}\n")
+        for index, node_id in sorted(lookup.items()):
+            encoded = node_id.encode("utf-8")
+            values = " ".join(str(value) for value in encoded)
+            suffix = f" {values}" if values else ""
+            file.write(f"{index} {len(encoded)}{suffix}\n")
+
+
+def node_ownership_path(heatmap_path):
+    """Return the expected Priority Map ownership file for one heatmap image."""
+    heatmap_path = Path(heatmap_path)
+    return heatmap_path.with_name(f"{heatmap_path.stem}.nodes.npz")
+
+
+def load_node_ownership(path):
+    """Load and validate a Priority Map 2D node_ids ownership array."""
+    import numpy as np
+
+    path = Path(path)
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if "node_ids" not in data.files:
+                raise ValueError(f"Ownership file is missing 'node_ids': {path}")
+            node_ids = np.asarray(data["node_ids"])
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(f"Could not read ownership file {path}: {error}") from error
+
+    if node_ids.ndim != 2:
+        raise ValueError(f"Ownership node_ids must be 2D in {path}; got {node_ids.shape}")
+    if node_ids.dtype.kind not in {"U", "S"}:
+        raise ValueError(f"Ownership node_ids must contain strings in {path}")
+    return node_ids.astype(str, copy=False)
+
+
+def sample_node_ownership(node_ids, pixel_x, pixel_y, camera_width, camera_height):
+    """Nearest-neighbor sample ownership at camera-resolution pixel coordinates."""
+    import numpy as np
+
+    height, width = node_ids.shape
+    if width == 0 or height == 0:
+        raise ValueError("Ownership node_ids must not be empty")
+    owner_x = np.clip(
+        np.floor((np.asarray(pixel_x) + 0.5) * width / camera_width).astype(int),
+        0,
+        width - 1,
+    )
+    owner_y = np.clip(
+        np.floor((np.asarray(pixel_y) + 0.5) * height / camera_height).astype(int),
+        0,
+        height - 1,
+    )
+    return node_ids[owner_y, owner_x]
 
 
 def smooth_colors_on_mesh(colors, faces, assigned, iterations, strength):
@@ -698,6 +823,7 @@ def apply_heatmaps_as_vertex_colors(
     base_colors = np.full((len(vertices), 3), 180, dtype=np.float32)
     heatmap_colors = np.full((len(vertices), 3), 180, dtype=np.float32)
     assigned = np.zeros(len(vertices), dtype=bool)
+    vertex_node_ids = np.full(len(vertices), "", dtype=object)
 
     image_poses = list(sync_data["images"].values())
     for image_pose in reversed(image_poses):
@@ -741,6 +867,17 @@ def apply_heatmaps_as_vertex_colors(
         pixel_x = np.clip(np.rint(u[valid]).astype(int), 0, camera.width - 1)
         pixel_y = np.clip(np.rint(v[valid]).astype(int), 0, camera.height - 1)
         heatmap_colors[target_indices] = heatmap_pixels[pixel_y, pixel_x]
+        ownership_path = node_ownership_path(heatmap_path)
+        if ownership_path.exists():
+            ownership = load_node_ownership(ownership_path)
+            sampled_node_ids = sample_node_ownership(
+                ownership,
+                pixel_x,
+                pixel_y,
+                camera.width,
+                camera.height,
+            )
+            vertex_node_ids[target_indices] = sampled_node_ids.astype(str)
         if heatmap_only:
             base_colors[target_indices] = heatmap_pixels[pixel_y, pixel_x]
         else:
@@ -772,8 +909,28 @@ def apply_heatmaps_as_vertex_colors(
         if output_path is not None
         else colmap_output / "heatmapped_vertex_colors.ply"
     )
-    write_colored_ply(output_path, vertices, faces, np.clip(colors, 0, 255).astype(np.uint8))
-    return sync_data, output_path, int(assigned.sum()), len(vertices)
+    unique_node_ids = sorted({str(node_id) for node_id in vertex_node_ids if str(node_id)})
+    node_id_to_index = {node_id: index for index, node_id in enumerate(unique_node_ids)}
+    node_indices = np.asarray(
+        [node_id_to_index.get(str(node_id), -1) for node_id in vertex_node_ids],
+        dtype=np.int32,
+    )
+    write_colored_ply(
+        output_path,
+        vertices,
+        faces,
+        np.clip(colors, 0, 255).astype(np.uint8),
+        node_indices=node_indices,
+        node_ids=unique_node_ids,
+    )
+    return (
+        sync_data,
+        output_path,
+        int(assigned.sum()),
+        len(vertices),
+        int(np.count_nonzero(node_indices >= 0)),
+        len(unique_node_ids),
+    )
 
 
 def build_heatmap_workspace(
@@ -917,7 +1074,14 @@ def project_heatmaps(
     geometry_path = Path(mesh_path) if mesh_path is not None else reconstruction.mesh_path
 
     if method == "vertex-colors":
-        sync_data, mesh_output, assigned_count, vertex_count = apply_heatmaps_as_vertex_colors(
+        (
+            sync_data,
+            mesh_output,
+            assigned_count,
+            vertex_count,
+            associated_vertex_count,
+            associated_node_count,
+        ) = apply_heatmaps_as_vertex_colors(
             reconstruction.output_dir,
             heatmap_dir,
             output_path=output_path,
@@ -942,6 +1106,8 @@ def project_heatmaps(
             extra_heatmaps=tuple(sync_data["extra_heatmaps"]),
             assigned_vertices=assigned_count,
             total_vertices=vertex_count,
+            associated_vertices=associated_vertex_count,
+            associated_nodes=associated_node_count,
         )
 
     sync_data, mesh_output, texture_output = apply_heatmaps_to_mesh(
@@ -965,6 +1131,8 @@ def project_heatmaps(
         extra_heatmaps=tuple(sync_data["extra_heatmaps"]),
         assigned_vertices=None,
         total_vertices=None,
+        associated_vertices=None,
+        associated_nodes=None,
     )
 
 
@@ -1119,6 +1287,10 @@ def main():
         print("Heatmap vertex coloring complete")
         print(f"Mesh output: {result.output_mesh_path}")
         print(f"Colored vertices: {result.assigned_vertices} / {result.total_vertices}")
+        print(
+            "Node-associated vertices: "
+            f"{result.associated_vertices} across {result.associated_nodes} node(s)"
+        )
         if result.assigned_vertices < result.total_vertices:
             print("Note: unprojected vertices were left neutral gray")
         return

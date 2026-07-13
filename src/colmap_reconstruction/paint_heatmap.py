@@ -2,11 +2,12 @@
 """Interactive vertex-color painting for PLY meshes."""
 
 import argparse
+import sqlite3
 import sys
 from pathlib import Path
 
 from .apply_heatmaps import write_colored_ply
-from .object_pins import read_colored_ply_mesh
+from .object_pins import read_pinned_ply_mesh
 
 
 DEFAULT_HEAT_VALUE = 0.75
@@ -38,6 +39,83 @@ def opencv_jet_color(value):
     return tuple(round(channel * 255.0) for channel in (red, green, blue))
 
 
+def nearest_jet_score(rgb):
+    """Return the 0..100 score of the nearest OpenCV JET RGB entry."""
+    import numpy as np
+
+    palette = np.asarray(
+        [opencv_jet_color(index / 255.0) for index in range(256)],
+        dtype=np.float32,
+    )
+    color = np.asarray(rgb, dtype=np.float32)
+    index = int(np.argmin(np.sum((palette - color) ** 2, axis=1)))
+    return index / 255.0 * 100.0
+
+
+class GraphDatabaseSession:
+    """Validated writable access to Priority Map base-node colors and scores."""
+
+    REQUIRED_COLUMNS = {"id", "score", "color_r", "color_g", "color_b"}
+
+    def __init__(self, path, required_node_ids):
+        self.path = Path(path).resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"Graph DB not found: {self.path}")
+        self.connection = sqlite3.connect(self.path)
+        columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(nodes)")
+        }
+        missing_columns = sorted(self.REQUIRED_COLUMNS - columns)
+        if missing_columns:
+            self.close()
+            raise ValueError(
+                "Graph DB nodes table is missing column(s): "
+                + ", ".join(missing_columns)
+            )
+        self.states = self.read_states(required_node_ids)
+        missing_nodes = sorted(set(required_node_ids) - set(self.states))
+        if missing_nodes:
+            self.close()
+            raise ValueError(
+                "Pinned node ID(s) are missing from graph.db: "
+                + ", ".join(missing_nodes)
+            )
+
+    def read_states(self, node_ids):
+        node_ids = list(dict.fromkeys(node_ids))
+        if not node_ids:
+            return {}
+        placeholders = ",".join("?" for _ in node_ids)
+        rows = self.connection.execute(
+            f"SELECT id, score, color_r, color_g, color_b "
+            f"FROM nodes WHERE id IN ({placeholders})",
+            node_ids,
+        ).fetchall()
+        return {
+            str(node_id): (float(score), int(red), int(green), int(blue))
+            for node_id, score, red, green, blue in rows
+        }
+
+    def update_states(self, states):
+        if not states:
+            return
+        with self.connection:
+            self.connection.executemany(
+                """
+                UPDATE nodes
+                SET score = ?, color_r = ?, color_g = ?, color_b = ?
+                WHERE id = ?
+                """,
+                [(*state, node_id) for node_id, state in states.items()],
+            )
+        self.states.update(states)
+
+    def close(self):
+        if getattr(self, "connection", None) is not None:
+            self.connection.close()
+            self.connection = None
+
+
 def default_output_path(input_path):
     input_path = Path(input_path)
     return input_path.with_name(f"{input_path.stem}_painted{input_path.suffix}")
@@ -50,6 +128,7 @@ class HeatmapPainter:
         self,
         input_path,
         output_path=None,
+        graph_db=None,
         heat_value=DEFAULT_HEAT_VALUE,
         brush_opacity=DEFAULT_BRUSH_OPACITY,
         max_overlay_opacity=DEFAULT_MAX_OVERLAY_OPACITY,
@@ -69,9 +148,41 @@ class HeatmapPainter:
         if not 0.0 < max_overlay_opacity <= 1.0:
             raise ValueError("max_overlay_opacity must be greater than 0 and at most 1")
 
-        self.vertices, self.faces, loaded_colors = read_colored_ply_mesh(self.input_path)
+        (
+            self.vertices,
+            self.faces,
+            loaded_colors,
+            self.node_indices,
+            self.pin_node_indices,
+            self.node_ids,
+        ) = read_pinned_ply_mesh(self.input_path)
         if not len(self.vertices):
             raise ValueError("PLY contains no vertices")
+        self.node_id_to_index = {
+            node_id: index for index, node_id in self.node_ids.items()
+        }
+        self.graph = None
+        self.opening_db_states = {}
+        if graph_db is not None:
+            if self.node_indices is None or self.pin_node_indices is None:
+                raise ValueError(
+                    "Graph synchronization requires a pinned PLY containing "
+                    "node_index and pin_node_index properties"
+                )
+            pin_lookup_indices = {
+                int(index) for index in self.pin_node_indices if int(index) >= 0
+            }
+            missing_lookup = sorted(pin_lookup_indices - set(self.node_ids))
+            if missing_lookup:
+                raise ValueError(f"Pin metadata references unknown indices: {missing_lookup}")
+            pin_node_ids = [self.node_ids[index] for index in sorted(pin_lookup_indices)]
+            if not pin_node_ids:
+                raise ValueError("Graph synchronization requires at least one embedded pin")
+            self.graph = GraphDatabaseSession(graph_db, pin_node_ids)
+            self.opening_db_states = dict(self.graph.states)
+            for node_id, (_, red, green, blue) in self.graph.states.items():
+                lookup_index = self.node_id_to_index[node_id]
+                loaded_colors[self.pin_node_indices == lookup_index] = (red, green, blue)
         self.base_colors = loaded_colors.astype(np.float32)
         self.colors = self.base_colors.copy()
         self.overlay_colors = np.zeros_like(self.base_colors)
@@ -118,8 +229,16 @@ class HeatmapPainter:
 
         alpha = self.overlay_alpha[:, None]
         self.colors[:] = self.base_colors * (1.0 - alpha) + self.overlay_colors * alpha
-        self.mesh.point_data["colors"] = np.clip(self.colors, 0, 255).astype(np.uint8)
-        self.plotter.render()
+        if hasattr(self, "mesh"):
+            self.mesh.point_data["colors"] = np.clip(self.colors, 0, 255).astype(np.uint8)
+        if hasattr(self, "plotter"):
+            self.plotter.render()
+
+    def _filter_brush_indices(self, indices):
+        """Exclude generated pin-marker geometry from surface painting."""
+        if self.pin_node_indices is None:
+            return list(indices)
+        return [index for index in indices if self.pin_node_indices[index] < 0]
 
     def _begin_stroke(self):
         self._stroke_before = {}
@@ -131,7 +250,22 @@ class HeatmapPainter:
             indices = list(self._stroke_before)
             before_alpha = [self._stroke_before[index][0] for index in indices]
             before_colors = [self._stroke_before[index][1] for index in indices]
-            self.undo_stack.append((indices, before_alpha, before_colors))
+            try:
+                db_before = self._update_graph_from_touched_vertices(indices)
+            except Exception as error:
+                self.overlay_alpha[indices] = before_alpha
+                self.overlay_colors[indices] = before_colors
+                self._refresh_colors()
+                self._set_status(f"Database update failed; stroke reverted: {error}")
+            else:
+                self.undo_stack.append(
+                    {
+                        "indices": indices,
+                        "before_alpha": before_alpha,
+                        "before_colors": before_colors,
+                        "db_before": db_before,
+                    }
+                )
         self._stroke_before = {}
         self._painting = False
         self._last_pick = None
@@ -152,6 +286,7 @@ class HeatmapPainter:
         ids = vtk.vtkIdList()
         self.locator.FindPointsWithinRadius(self.brush_radius, position, ids)
         indices = [ids.GetId(index) for index in range(ids.GetNumberOfIds())]
+        indices = self._filter_brush_indices(indices)
         for index in indices:
             self._stroke_before.setdefault(
                 index, (float(self.overlay_alpha[index]), self.overlay_colors[index].copy())
@@ -182,6 +317,59 @@ class HeatmapPainter:
                 + np.asarray(self.brush_color, dtype=np.float32) * mix[:, None]
             )
         self._refresh_colors()
+
+    def _pin_vertices_for_node(self, node_id):
+        import numpy as np
+
+        if self.pin_node_indices is None:
+            return np.empty(0, dtype=np.int64)
+        lookup_index = self.node_id_to_index.get(node_id)
+        if lookup_index is None:
+            return np.empty(0, dtype=np.int64)
+        return np.flatnonzero(self.pin_node_indices == lookup_index)
+
+    def _set_pin_color(self, node_id, rgb):
+        pin_vertices = self._pin_vertices_for_node(node_id)
+        if len(pin_vertices):
+            self.base_colors[pin_vertices] = rgb
+
+    def _restore_graph_states(self, states):
+        if not states or self.graph is None:
+            return
+        self.graph.update_states(states)
+        for node_id, (_, red, green, blue) in states.items():
+            self._set_pin_color(node_id, (red, green, blue))
+
+    def _update_graph_from_touched_vertices(self, touched_indices):
+        """Update every pinned node represented by this stroke's base vertices."""
+        import numpy as np
+
+        if self.graph is None or self.node_indices is None:
+            return {}
+        touched = np.asarray(touched_indices, dtype=np.int64)
+        touched_lookup_indices = {
+            int(index) for index in self.node_indices[touched] if int(index) >= 0
+        }
+        updates = {}
+        before = {}
+        for lookup_index in sorted(touched_lookup_indices):
+            node_id = self.node_ids.get(lookup_index)
+            if node_id not in self.graph.states or not len(self._pin_vertices_for_node(node_id)):
+                continue
+            node_vertices = touched[self.node_indices[touched] == lookup_index]
+            median_rgb = tuple(
+                int(round(value))
+                for value in np.median(self.colors[node_vertices], axis=0)
+            )
+            before[node_id] = self.graph.states[node_id]
+            updates[node_id] = (nearest_jet_score(median_rgb), *median_rgb)
+
+        self.graph.update_states(updates)
+        for node_id, (_, red, green, blue) in updates.items():
+            self._set_pin_color(node_id, (red, green, blue))
+        if updates:
+            self._refresh_colors()
+        return before
 
     def _set_mode(self, mode):
         self.mode = mode
@@ -244,9 +432,12 @@ class HeatmapPainter:
         if not self.undo_stack:
             self._set_status("Nothing to undo")
             return
-        indices, before_alpha, before_colors = self.undo_stack.pop()
-        self.overlay_alpha[indices] = before_alpha
-        self.overlay_colors[indices] = before_colors
+        entry = self.undo_stack.pop()
+        indices = entry["indices"]
+        if len(indices):
+            self.overlay_alpha[indices] = entry["before_alpha"]
+            self.overlay_colors[indices] = entry["before_colors"]
+        self._restore_graph_states(entry["db_before"])
         self._refresh_colors()
         self._set_status()
 
@@ -254,11 +445,26 @@ class HeatmapPainter:
         import numpy as np
 
         changed = np.flatnonzero(self.overlay_alpha > 0.0)
-        if len(changed):
+        db_before = {}
+        if self.graph is not None:
+            db_before = {
+                node_id: state
+                for node_id, state in self.graph.states.items()
+                if state != self.opening_db_states[node_id]
+            }
+        if len(changed) or db_before:
             self.undo_stack.append(
-                (changed, self.overlay_alpha[changed].copy(), self.overlay_colors[changed].copy())
+                {
+                    "indices": changed,
+                    "before_alpha": self.overlay_alpha[changed].copy(),
+                    "before_colors": self.overlay_colors[changed].copy(),
+                    "db_before": db_before,
+                }
             )
             self.overlay_alpha[:] = 0.0
+            self._restore_graph_states(
+                {node_id: self.opening_db_states[node_id] for node_id in db_before}
+            )
             self._refresh_colors()
         self._set_status()
 
@@ -282,10 +488,23 @@ class HeatmapPainter:
         if not selected:
             self._set_status("Save cancelled")
             return
-        path = Path(selected)
-        write_colored_ply(path, self.vertices, self.faces, self.colors.clip(0, 255).astype("uint8"))
-        self.output_path = path
+        path = self.save(selected)
         self._set_status(f"Saved painted copy: {path}")
+
+    def save(self, path):
+        """Save the current colors while preserving embedded node associations."""
+        path = Path(path)
+        write_colored_ply(
+            path,
+            self.vertices,
+            self.faces,
+            self.colors.clip(0, 255).astype("uint8"),
+            node_indices=self.node_indices,
+            node_ids=self.node_ids,
+            pin_node_indices=self.pin_node_indices,
+        )
+        self.output_path = path
+        return path
 
     def show(self):
         try:
@@ -340,12 +559,21 @@ class HeatmapPainter:
         self.plotter.add_key_event("u", self.undo)
         self.plotter.add_key_event("c", self.clear)
         self.plotter.add_key_event("s", self.save_as)
-        self.plotter.show()
+        try:
+            self.plotter.show()
+        finally:
+            if self.graph is not None:
+                self.graph.close()
 
 
-def paint_heatmap(input_path, output_path=None, **kwargs):
+def paint_heatmap(input_path, graph_db=None, output_path=None, **kwargs):
     """Open an interactive painter for any PLY and return the painter session."""
-    painter = HeatmapPainter(input_path, output_path=output_path, **kwargs)
+    painter = HeatmapPainter(
+        input_path,
+        output_path=output_path,
+        graph_db=graph_db,
+        **kwargs,
+    )
     painter.show()
     return painter
 
@@ -353,6 +581,11 @@ def paint_heatmap(input_path, output_path=None, **kwargs):
 def main():
     parser = argparse.ArgumentParser(description="Paint a translucent heat overlay on any PLY mesh")
     parser.add_argument("ply", help="PLY mesh to open")
+    parser.add_argument(
+        "graph_db",
+        nargs="?",
+        help="Optional Priority Map graph.db for live pin/score synchronization",
+    )
     parser.add_argument("--output", help="Suggested Save As path; input is never overwritten automatically")
     parser.add_argument("--brush-opacity", type=float, default=DEFAULT_BRUSH_OPACITY)
     parser.add_argument(
@@ -365,6 +598,7 @@ def main():
     try:
         paint_heatmap(
             args.ply,
+            graph_db=args.graph_db,
             output_path=args.output,
             brush_opacity=args.brush_opacity,
             max_overlay_opacity=args.max_overlay_opacity,

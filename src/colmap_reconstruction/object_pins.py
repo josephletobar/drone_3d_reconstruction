@@ -184,6 +184,58 @@ def place_nodes_with_nearest_mesh_height(vertices, nodes, up_offset):
     return pins
 
 
+def place_nodes_from_vertex_associations(
+    vertices,
+    nodes,
+    vertex_node_indices,
+    node_ids,
+    up_offset,
+):
+    """Place one pin per graph node near the median of its associated vertices."""
+    import numpy as np
+
+    if vertex_node_indices is None:
+        return [], tuple(node["id"] for node in nodes)
+
+    lookup_by_node_id = {node_id: index for index, node_id in node_ids.items()}
+    pins = []
+    unmatched = []
+    for node in nodes:
+        lookup_index = lookup_by_node_id.get(node["id"])
+        if lookup_index is None:
+            unmatched.append(node["id"])
+            continue
+        associated = np.flatnonzero(vertex_node_indices == lookup_index)
+        if len(associated) == 0:
+            unmatched.append(node["id"])
+            continue
+
+        associated_vertices = vertices[associated]
+        center = np.median(associated_vertices, axis=0)
+        local_index = int(
+            np.argmin(np.linalg.norm(associated_vertices - center, axis=1))
+        )
+        vertex_index = int(associated[local_index])
+        vertex = vertices[vertex_index]
+        pin = dict(node)
+        pin.update(
+            {
+                "x": float(vertex[0]),
+                "y": float(vertex[1]),
+                "z": float(vertex[2] + up_offset),
+                "vertex_index": vertex_index,
+                "nearest_mesh_x": float(vertex[0]),
+                "nearest_mesh_y": float(vertex[1]),
+                "nearest_mesh_z": float(vertex[2]),
+                "nearest_mesh_distance": 0.0,
+                "pin_up_offset": float(up_offset),
+            }
+        )
+        pins.append(pin)
+
+    return pins, tuple(unmatched)
+
+
 def preferred_base_mesh(colmap_output, fallback_mesh_path):
     """Prefer a heatmapped vertex-color mesh when available."""
     colmap_output = Path(colmap_output)
@@ -193,8 +245,8 @@ def preferred_base_mesh(colmap_output, fallback_mesh_path):
     return Path(fallback_mesh_path)
 
 
-def read_colored_ply_mesh(path):
-    """Read PLY vertex positions, colors, and faces from ASCII or little-endian PLY."""
+def read_pinned_ply_mesh(path):
+    """Read geometry, colors, base-node associations, and pin ownership."""
     import numpy as np
 
     path = Path(path)
@@ -203,10 +255,24 @@ def read_colored_ply_mesh(path):
         vertices = []
         colors = []
         faces = []
+        node_indices = []
+        pin_node_indices = []
+        node_ids = {}
+        has_node_indices = False
+        has_pin_node_indices = False
 
         for element in elements:
             name = element["name"]
             properties = element["properties"]
+            if name == "vertex":
+                has_node_indices = any(
+                    prop[0] == "scalar" and prop[2] == "node_index"
+                    for prop in properties
+                )
+                has_pin_node_indices = any(
+                    prop[0] == "scalar" and prop[2] == "pin_node_index"
+                    for prop in properties
+                )
             for _ in range(element["count"]):
                 row = {}
                 if fmt == "ascii":
@@ -251,16 +317,64 @@ def read_colored_ply_mesh(path):
                             _color_value(blue, 180),
                         )
                     )
+                    node_indices.append(int(row.get("node_index", -1)))
+                    pin_node_indices.append(int(row.get("pin_node_index", -1)))
                 elif name == "face":
                     indices = row.get("vertex_indices", row.get("vertex_index"))
                     if indices:
                         faces.append(indices)
+                elif name == "node_label":
+                    index = int(row["index"])
+                    if index in node_ids:
+                        raise ValueError(f"Duplicate node lookup index {index} in {path}")
+                    encoded = bytes(int(value) for value in row.get("node_id", []))
+                    try:
+                        node_ids[index] = encoded.decode("utf-8")
+                    except UnicodeDecodeError as error:
+                        raise ValueError(
+                            f"Invalid UTF-8 node ID at lookup index {index} in {path}"
+                        ) from error
+
+    node_index_array = (
+        np.asarray(node_indices, dtype=np.int32) if has_node_indices else None
+    )
+    if node_index_array is not None:
+        referenced = {int(index) for index in node_index_array if int(index) >= 0}
+        missing = sorted(referenced - set(node_ids))
+        if missing:
+            raise ValueError(f"PLY node lookup is missing index/indices {missing}: {path}")
+
+    pin_node_index_array = (
+        np.asarray(pin_node_indices, dtype=np.int32)
+        if has_pin_node_indices
+        else None
+    )
+    if pin_node_index_array is not None:
+        referenced = {int(index) for index in pin_node_index_array if int(index) >= 0}
+        missing = sorted(referenced - set(node_ids))
+        if missing:
+            raise ValueError(f"PLY pin lookup is missing index/indices {missing}: {path}")
 
     return (
         np.asarray(vertices, dtype=np.float64),
         faces,
         np.asarray(colors, dtype=np.uint8),
+        node_index_array,
+        pin_node_index_array,
+        node_ids,
     )
+
+
+def read_labeled_ply_mesh(path):
+    """Read geometry, colors, and base-node associations, ignoring pin ownership."""
+    vertices, faces, colors, node_indices, _, node_ids = read_pinned_ply_mesh(path)
+    return vertices, faces, colors, node_indices, node_ids
+
+
+def read_colored_ply_mesh(path):
+    """Read PLY positions, faces, and colors while ignoring optional node IDs."""
+    vertices, faces, colors, _, _ = read_labeled_ply_mesh(path)
+    return vertices, faces, colors
 
 
 def write_pins_csv(path, pins):
@@ -374,10 +488,32 @@ def pin_marker_geometry(pins, marker_scale):
     )
 
 
-def write_combined_pin_mesh(path, base_vertices, base_faces, base_colors, pins, marker_scale):
+def write_combined_pin_mesh(
+    path,
+    base_vertices,
+    base_faces,
+    base_colors,
+    pins,
+    marker_scale,
+    node_indices=None,
+    node_ids=None,
+    pin_node_indices=None,
+):
     import numpy as np
 
     pin_vertices, pin_faces, pin_colors = pin_marker_geometry(pins, marker_scale)
+    lookup_by_node_id = {
+        node_id: index for index, node_id in (node_ids or {}).items()
+    }
+    marker_pin_indices = np.asarray(
+        [lookup_by_node_id[pin["id"]] for pin in pins for _ in range(6)],
+        dtype=np.int32,
+    )
+    base_pin_indices = (
+        np.asarray(pin_node_indices, dtype=np.int32)
+        if pin_node_indices is not None
+        else np.full(len(base_vertices), -1, dtype=np.int32)
+    )
     if len(pin_vertices):
         face_offset = len(base_vertices)
         combined_vertices = np.vstack([base_vertices, pin_vertices])
@@ -386,12 +522,35 @@ def write_combined_pin_mesh(path, base_vertices, base_faces, base_colors, pins, 
             [int(index) + face_offset for index in face]
             for face in pin_faces
         ]
+        combined_node_indices = (
+            np.concatenate(
+                [
+                    np.asarray(node_indices, dtype=np.int32),
+                    np.full(len(pin_vertices), -1, dtype=np.int32),
+                ]
+            )
+            if node_indices is not None
+            else None
+        )
+        combined_pin_node_indices = np.concatenate(
+            [base_pin_indices, marker_pin_indices]
+        )
     else:
         combined_vertices = base_vertices
         combined_colors = base_colors
         combined_faces = base_faces
+        combined_node_indices = node_indices
+        combined_pin_node_indices = base_pin_indices
 
-    write_colored_ply(path, combined_vertices, combined_faces, combined_colors)
+    write_colored_ply(
+        path,
+        combined_vertices,
+        combined_faces,
+        combined_colors,
+        node_indices=combined_node_indices,
+        node_ids=node_ids,
+        pin_node_indices=combined_pin_node_indices,
+    )
     return combined_vertices, combined_faces, combined_colors
 
 
@@ -490,13 +649,38 @@ def project_object_pins(reconstruction, graph_db):
     base_mesh_path = preferred_base_mesh(reconstruction.output_dir, geometry_path)
 
     nodes = load_graph_nodes(graph_db)
-    vertices, faces, colors = read_colored_ply_mesh(base_mesh_path)
-    marker_scale = default_marker_scale(vertices)
-    original_pins = place_nodes_with_nearest_mesh_height(
+    (
         vertices,
-        nodes,
-        default_pin_up_offset(marker_scale),
-    )
+        faces,
+        colors,
+        node_indices,
+        pin_node_indices,
+        node_ids,
+    ) = read_pinned_ply_mesh(base_mesh_path)
+    marker_scale = default_marker_scale(vertices)
+    # Reconstructed surfaces in this pipeline face negative Z, so pins belong
+    # on that visible side of the mesh.
+    pin_up_offset = -default_pin_up_offset(marker_scale)
+    use_vertex_associations = node_indices is not None and bool(node_ids)
+    if use_vertex_associations:
+        original_pins, unmatched_nodes = place_nodes_from_vertex_associations(
+            vertices,
+            nodes,
+            node_indices,
+            node_ids,
+            pin_up_offset,
+        )
+    else:
+        original_pins = place_nodes_with_nearest_mesh_height(
+            vertices,
+            nodes,
+            pin_up_offset,
+        )
+        unmatched_nodes = ()
+    pin_output_node_ids = node_ids or {
+        index: pin["id"]
+        for index, pin in enumerate(sorted(original_pins, key=lambda pin: pin["id"]))
+    }
     (
         leveled_vertices,
         xy_center,
@@ -506,11 +690,20 @@ def project_object_pins(reconstruction, graph_db):
         normal,
         angle_degrees,
     ) = level_base_mesh(vertices)
-    leveled_pins = place_nodes_with_nearest_mesh_height(
-        leveled_vertices,
-        nodes,
-        default_pin_up_offset(marker_scale),
-    )
+    if use_vertex_associations:
+        leveled_pins, _ = place_nodes_from_vertex_associations(
+            leveled_vertices,
+            nodes,
+            node_indices,
+            node_ids,
+            pin_up_offset,
+        )
+    else:
+        leveled_pins = place_nodes_with_nearest_mesh_height(
+            leveled_vertices,
+            nodes,
+            pin_up_offset,
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     write_pins_csv(pins_csv_path, leveled_pins)
@@ -521,8 +714,19 @@ def project_object_pins(reconstruction, graph_db):
         colors,
         original_pins,
         marker_scale,
+        node_indices=node_indices,
+        node_ids=node_ids,
+        pin_node_indices=pin_node_indices,
     )
-    write_colored_ply(leveled_base_mesh_path, leveled_vertices, faces, colors)
+    write_colored_ply(
+        leveled_base_mesh_path,
+        leveled_vertices,
+        faces,
+        colors,
+        node_indices=node_indices,
+        node_ids=pin_output_node_ids,
+        pin_node_indices=pin_node_indices,
+    )
     write_level_transform(
         level_transform_path,
         xy_center,
@@ -539,6 +743,9 @@ def project_object_pins(reconstruction, graph_db):
         colors,
         leveled_pins,
         marker_scale,
+        node_indices=node_indices,
+        node_ids=pin_output_node_ids,
+        pin_node_indices=pin_node_indices,
     )
 
     return ObjectPinProjectionResult(
@@ -552,7 +759,7 @@ def project_object_pins(reconstruction, graph_db):
         level_transform_path=level_transform_path,
         base_mesh_path=base_mesh_path,
         matched_nodes=tuple(pin["id"] for pin in leveled_pins),
-        unmatched_nodes=(),
+        unmatched_nodes=unmatched_nodes,
         pin_count=len(leveled_pins),
     )
 
