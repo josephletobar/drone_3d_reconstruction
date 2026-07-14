@@ -770,6 +770,11 @@ def main():
     )
     parser.add_argument("colmap_output", help="Path to a completed COLMAP output folder")
     parser.add_argument("graph_db", help="Path to graph.db from priority_map")
+    parser.add_argument(
+        "--view",
+        action="store_true",
+        help="Open the generated pinned mesh with database names shown above its pins",
+    )
     args = parser.parse_args()
 
     reconstruction = ReconstructionResult.from_output_dir(args.colmap_output)
@@ -788,6 +793,10 @@ def main():
     print(f"Leveled reconstruction mesh: {result.leveled_base_mesh_path}")
     print(f"Leveled object pin mesh: {result.leveled_output_mesh_path}")
     print(f"Level transform: {result.level_transform_path}")
+    if args.view:
+        from .paint_heatmap import paint_heatmap
+
+        paint_heatmap(result.output_mesh_path, graph_db=result.graph_db)
 
 
 if __name__ == "__main__":

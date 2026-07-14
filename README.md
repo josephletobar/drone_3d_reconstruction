@@ -170,6 +170,14 @@ contains embedded vertex-to-node associations:
 colmap-object-pins C:\path\to\colmap_output C:\path\to\graph.db
 ```
 
+Add `--view` to open the generated pinned mesh immediately in the custom
+PyVista viewer. Human-readable database names appear in translucent labels
+above the pins, and the viewer starts in navigation mode; painting is optional.
+
+```powershell
+colmap-object-pins C:\path\to\colmap_output C:\path\to\graph.db --view
+```
+
 This reads the base `nodes` table and writes outputs under
 `colmap_output\object_pins`:
 

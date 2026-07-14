@@ -40,6 +40,7 @@ class PaintHeatmapTests(unittest.TestCase):
                 """
                 CREATE TABLE nodes (
                     id TEXT PRIMARY KEY,
+                    label TEXT,
                     score REAL,
                     color_r INTEGER,
                     color_g INTEGER,
@@ -48,10 +49,10 @@ class PaintHeatmapTests(unittest.TestCase):
                 """
             )
             connection.executemany(
-                "INSERT INTO nodes VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    ("house_0", 10.0, 1, 2, 3),
-                    ("car_0", 20.0, 4, 5, 6),
+                    ("house_0", "House", 10.0, 1, 2, 3),
+                    ("car_0", "Car", 20.0, 4, 5, 6),
                 ],
             )
             connection.commit()
@@ -154,6 +155,19 @@ class PaintHeatmapTests(unittest.TestCase):
         temp_dir, _, painter = self._make_graph_painter()
         try:
             self.assertEqual(painter._filter_brush_indices(range(6)), [0, 1, 2, 3])
+        finally:
+            painter.graph.close()
+            temp_dir.cleanup()
+
+    def test_pin_labels_use_database_names_at_pin_tips(self):
+        temp_dir, _, painter = self._make_graph_painter()
+        try:
+            points, labels = painter._pin_label_data()
+
+            self.assertEqual(labels, ["House", "Car"])
+            np.testing.assert_array_equal(points, [[4.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+            self.assertNotIn("house_0", labels)
+            self.assertNotIn("car_0", labels)
         finally:
             painter.graph.close()
             temp_dir.cleanup()

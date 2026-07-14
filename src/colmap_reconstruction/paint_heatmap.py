@@ -73,6 +73,7 @@ class GraphDatabaseSession:
                 + ", ".join(missing_columns)
             )
         self.states = self.read_states(required_node_ids)
+        self.labels = self.read_labels(required_node_ids) if "label" in columns else {}
         missing_nodes = sorted(set(required_node_ids) - set(self.states))
         if missing_nodes:
             self.close()
@@ -94,6 +95,22 @@ class GraphDatabaseSession:
         return {
             str(node_id): (float(score), int(red), int(green), int(blue))
             for node_id, score, red, green, blue in rows
+        }
+
+    def read_labels(self, node_ids):
+        """Return human-readable names without exposing node IDs as labels."""
+        node_ids = list(dict.fromkeys(node_ids))
+        if not node_ids:
+            return {}
+        placeholders = ",".join("?" for _ in node_ids)
+        rows = self.connection.execute(
+            f"SELECT id, label FROM nodes WHERE id IN ({placeholders})",
+            node_ids,
+        ).fetchall()
+        return {
+            str(node_id): str(label).strip()
+            for node_id, label in rows
+            if label is not None and str(label).strip()
         }
 
     def update_states(self, states):
@@ -328,6 +345,49 @@ class HeatmapPainter:
             return np.empty(0, dtype=np.int64)
         return np.flatnonzero(self.pin_node_indices == lookup_index)
 
+    def _pin_label_data(self):
+        """Return outward pin-tip positions and their human-readable DB labels."""
+        import numpy as np
+
+        if self.graph is None or self.pin_node_indices is None:
+            return np.empty((0, 3), dtype=np.float64), []
+        points = []
+        labels = []
+        for lookup_index in sorted(self.node_ids):
+            node_id = self.node_ids[lookup_index]
+            label = self.graph.labels.get(node_id)
+            if not label:
+                continue
+            pin_vertices = self._pin_vertices_for_node(node_id)
+            if not len(pin_vertices):
+                continue
+            marker_points = self.vertices[pin_vertices]
+            # Pins face the negative-Z side in this reconstruction pipeline.
+            points.append(marker_points[np.argmin(marker_points[:, 2])])
+            labels.append(label)
+        if not points:
+            return np.empty((0, 3), dtype=np.float64), []
+        return np.asarray(points, dtype=np.float64), labels
+
+    def _add_pin_labels(self):
+        points, labels = self._pin_label_data()
+        if not labels:
+            return
+        self._pin_label_actor = self.plotter.add_point_labels(
+            points,
+            labels,
+            name="pin_labels",
+            font_size=12,
+            text_color="white",
+            show_points=False,
+            shape="rounded_rect",
+            shape_color="black",
+            shape_opacity=0.55,
+            margin=5,
+            always_visible=True,
+            pickable=False,
+        )
+
     def _set_pin_color(self, node_id, rgb):
         pin_vertices = self._pin_vertices_for_node(node_id)
         if len(pin_vertices):
@@ -519,6 +579,7 @@ class HeatmapPainter:
         self.mesh = self._build_polydata()
         self.plotter = pv.Plotter(title=f"Heatmap Painter - {self.input_path.name}")
         self.plotter.add_mesh(self.mesh, scalars="colors", rgb=True, pickable=True)
+        self._add_pin_labels()
         self.plotter.add_axes()
         self._set_status()
         self.interactor = self.plotter.iren.interactor
