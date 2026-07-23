@@ -8,7 +8,5 @@ dependencies:
   - tqdm>=4.66
   - pillow
   - numpy
-  - matplotlib
-  - networkx
   - ffmpeg
   - pyvista>=0.46

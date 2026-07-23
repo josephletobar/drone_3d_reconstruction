@@ -12,8 +12,6 @@ dependencies = [
     "tqdm>=4.66",
     "pillow",
     "numpy",
-    "matplotlib",
-    "networkx",
     "pyvista>=0.46",
 ]
 
