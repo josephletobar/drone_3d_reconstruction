@@ -10,13 +10,14 @@ from colmap_reconstruction.paint_heatmap import (
     apply_brush,
     default_output_path,
     nearest_jet_score,
+    nearest_jet_entry,
     opencv_jet_color,
 )
 from colmap_reconstruction.apply_heatmaps import write_colored_ply
 
 
 class PaintHeatmapTests(unittest.TestCase):
-    def _make_graph_painter(self):
+    def _make_graph_painter(self, show_live_graph=False):
         temp_dir = tempfile.TemporaryDirectory()
         root = Path(temp_dir.name)
         ply = root / "pinned.ply"
@@ -44,21 +45,40 @@ class PaintHeatmapTests(unittest.TestCase):
                     score REAL,
                     color_r INTEGER,
                     color_g INTEGER,
-                    color_b INTEGER
+                    color_b INTEGER,
+                    geo_pos_x REAL,
+                    geo_pos_y REAL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE edges (
+                    source_id TEXT,
+                    target_id TEXT,
+                    weight REAL
                 )
                 """
             )
             connection.executemany(
-                "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    ("house_0", "House", 10.0, 1, 2, 3),
-                    ("car_0", "Car", 20.0, 4, 5, 6),
+                    ("house_0", "House", 10.0, 1, 2, 3, 0.0, 0.0),
+                    ("car_0", "Car", 20.0, 4, 5, 6, 1.0, 0.0),
                 ],
+            )
+            connection.execute(
+                "INSERT INTO edges VALUES (?, ?, ?)",
+                ("house_0", "car_0", 12.0),
             )
             connection.commit()
         finally:
             connection.close()
-        painter = HeatmapPainter(ply, graph_db=db)
+        painter = HeatmapPainter(
+            ply,
+            graph_db=db,
+            show_live_graph=show_live_graph,
+        )
         painter._set_status = lambda message=None: None
         return temp_dir, db, painter
 
@@ -132,11 +152,14 @@ class PaintHeatmapTests(unittest.TestCase):
                 }
             finally:
                 connection.close()
-            self.assertEqual(rows["house_0"][1:], (20, 110, 210))
-            self.assertAlmostEqual(rows["house_0"][0], nearest_jet_score((20, 110, 210)))
-            self.assertEqual(rows["car_0"][1:], (210, 60, 20))
-            np.testing.assert_array_equal(painter.base_colors[4], [20, 110, 210])
-            np.testing.assert_array_equal(painter.base_colors[5], [210, 60, 20])
+            house_score, house_rgb = nearest_jet_entry((20, 110, 210))
+            car_score, car_rgb = nearest_jet_entry((210, 60, 20))
+            self.assertEqual(rows["house_0"][1:], house_rgb)
+            self.assertAlmostEqual(rows["house_0"][0], house_score)
+            self.assertEqual(rows["car_0"][1:], car_rgb)
+            self.assertAlmostEqual(rows["car_0"][0], car_score)
+            np.testing.assert_array_equal(painter.base_colors[4], house_rgb)
+            np.testing.assert_array_equal(painter.base_colors[5], car_rgb)
 
             painter._restore_graph_states(before)
             connection = sqlite3.connect(db)
@@ -170,6 +193,29 @@ class PaintHeatmapTests(unittest.TestCase):
             self.assertNotIn("car_0", labels)
         finally:
             painter.graph.close()
+            temp_dir.cleanup()
+
+    def test_live_graph_is_opt_in_and_reads_committed_rgb(self):
+        temp_dir, _, regular = self._make_graph_painter()
+        live = None
+        try:
+            self.assertIsNone(regular.live_graph)
+            regular.graph.close()
+
+            live = HeatmapPainter(
+                regular.input_path,
+                graph_db=regular.graph.path,
+                show_live_graph=True,
+            )
+            self.assertIsNotNone(live.live_graph)
+            live.graph.update_states({"house_0": (50.0, 21, 31, 41)})
+            nodes, _ = live.live_graph._read()
+            self.assertEqual(nodes["house_0"]["rgb"], (21, 31, 41))
+            self.assertEqual(live.live_graph.render().shape, (500, 800, 3))
+        finally:
+            if live is not None:
+                live.graph.close()
+                live.live_graph.close()
             temp_dir.cleanup()
 
     def test_undo_and_clear_restore_database_and_pin_state(self):

@@ -216,6 +216,17 @@ embedded node associations together with its database:
 colmap-paint-heatmap C:\path\to\object_pins_on_mesh.ply C:\path\to\graph.db
 ```
 
+Add `--live-graph` to open the Priority Map spatial NetworkX graph beside the
+3D mesh in its own native Matplotlib window. The two windows are placed as the
+left and right halves of the desktop work area. The graph retains Matplotlib's
+zoom and pan controls and rereads committed node colors and scores after each
+paint stroke, undo, or clear operation. Without the flag, the painter retains
+its normal single-window layout.
+
+```powershell
+colmap-paint-heatmap C:\path\to\object_pins_on_mesh.ply C:\path\to\graph.db --live-graph
+```
+
 The painter always treats the colors already in the PLY as the base, whether
 they came from reconstruction, projected heatmaps, or earlier painting. Use
 the on-screen heat slider to choose a color from the OpenCV JET scale, then
@@ -239,8 +250,9 @@ paint_heatmap("/path/to/object_pins_on_mesh.ply", graph_db="/path/to/graph.db")
 
 With a database supplied, the painter groups touched surface vertices by their
 embedded node ID at the end of each stroke. For every node with a pin, it takes
-the median visible RGB, recolors the pin, writes that RGB to the base `nodes`
-table, and converts the nearest OpenCV JET color to a `0`-`100` priority score.
+the median visible RGB and snaps it to the nearest exact OpenCV JET entry. That
+exact palette RGB recolors the pin and base `nodes` row, and the same palette
+index becomes its `0`-`100` priority score.
 `U` restores mesh, pin, and database state for the previous stroke; `C` restores
 the database state from when the session opened. Database writes are immediate,
 while saving the painted PLY remains explicit. Without a database, painting is

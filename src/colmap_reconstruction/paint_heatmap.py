@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .apply_heatmaps import write_colored_ply
+from .live_graph import LiveKnowledgeGraph
 from .object_pins import read_pinned_ply_mesh
 
 
@@ -14,6 +15,26 @@ DEFAULT_HEAT_VALUE = 0.75
 DEFAULT_BRUSH_OPACITY = 0.18
 DEFAULT_MAX_OVERLAY_OPACITY = 0.55
 DEFAULT_BRUSH_RADIUS_FRACTION = 0.02
+
+
+def desktop_work_area():
+    """Return the Windows work area as left, top, width, height."""
+    if sys.platform != "win32":
+        return 0, 0, 1800, 900
+    import ctypes
+
+    class Rect(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    rect = Rect()
+    if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+        return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+    return 0, 0, 1800, 900
 
 
 def apply_brush(colors, indices, color, opacity):
@@ -41,6 +62,12 @@ def opencv_jet_color(value):
 
 def nearest_jet_score(rgb):
     """Return the 0..100 score of the nearest OpenCV JET RGB entry."""
+    score, _ = nearest_jet_entry(rgb)
+    return score
+
+
+def nearest_jet_entry(rgb):
+    """Return the score and exact RGB of the nearest OpenCV JET entry."""
     import numpy as np
 
     palette = np.asarray(
@@ -49,7 +76,7 @@ def nearest_jet_score(rgb):
     )
     color = np.asarray(rgb, dtype=np.float32)
     index = int(np.argmin(np.sum((palette - color) ** 2, axis=1)))
-    return index / 255.0 * 100.0
+    return index / 255.0 * 100.0, tuple(int(value) for value in palette[index])
 
 
 class GraphDatabaseSession:
@@ -146,6 +173,7 @@ class HeatmapPainter:
         input_path,
         output_path=None,
         graph_db=None,
+        show_live_graph=False,
         heat_value=DEFAULT_HEAT_VALUE,
         brush_opacity=DEFAULT_BRUSH_OPACITY,
         max_overlay_opacity=DEFAULT_MAX_OVERLAY_OPACITY,
@@ -179,6 +207,9 @@ class HeatmapPainter:
             node_id: index for index, node_id in self.node_ids.items()
         }
         self.graph = None
+        self.live_graph = None
+        if show_live_graph and graph_db is None:
+            raise ValueError("show_live_graph requires graph_db")
         self.opening_db_states = {}
         if graph_db is not None:
             if self.node_indices is None or self.pin_node_indices is None:
@@ -196,6 +227,8 @@ class HeatmapPainter:
             if not pin_node_ids:
                 raise ValueError("Graph synchronization requires at least one embedded pin")
             self.graph = GraphDatabaseSession(graph_db, pin_node_ids)
+            if show_live_graph:
+                self.live_graph = LiveKnowledgeGraph(graph_db)
             self.opening_db_states = dict(self.graph.states)
             for node_id, (_, red, green, blue) in self.graph.states.items():
                 lookup_index = self.node_id_to_index[node_id]
@@ -291,7 +324,7 @@ class HeatmapPainter:
         import vtk
 
         x, y = self.interactor.GetEventPosition()
-        if not self.picker.Pick(x, y, 0, self.plotter.renderer):
+        if not self.picker.Pick(x, y, 0, self.mesh_renderer):
             return
         position = self.picker.GetPickPosition()
         if self._last_pick is not None:
@@ -399,6 +432,7 @@ class HeatmapPainter:
         self.graph.update_states(states)
         for node_id, (_, red, green, blue) in states.items():
             self._set_pin_color(node_id, (red, green, blue))
+        self._refresh_live_graph()
 
     def _update_graph_from_touched_vertices(self, touched_indices):
         """Update every pinned node represented by this stroke's base vertices."""
@@ -421,15 +455,23 @@ class HeatmapPainter:
                 int(round(value))
                 for value in np.median(self.colors[node_vertices], axis=0)
             )
+            score, jet_rgb = nearest_jet_entry(median_rgb)
             before[node_id] = self.graph.states[node_id]
-            updates[node_id] = (nearest_jet_score(median_rgb), *median_rgb)
+            updates[node_id] = (score, *jet_rgb)
 
         self.graph.update_states(updates)
         for node_id, (_, red, green, blue) in updates.items():
             self._set_pin_color(node_id, (red, green, blue))
         if updates:
             self._refresh_colors()
+            self._refresh_live_graph()
         return before
+
+    def _refresh_live_graph(self):
+        """Refresh the neighboring native graph after a database change."""
+        if self.live_graph is None:
+            return
+        self.live_graph.refresh_window()
 
     def _set_mode(self, mode):
         self.mode = mode
@@ -577,11 +619,28 @@ class HeatmapPainter:
             ) from error
 
         self.mesh = self._build_polydata()
-        self.plotter = pv.Plotter(title=f"Heatmap Painter - {self.input_path.name}")
+        window_size = None
+        window_position = None
+        graph_geometry = None
+        if self.live_graph is not None:
+            left, top, width, height = desktop_work_area()
+            mesh_width = width // 2
+            window_size = (mesh_width, height)
+            window_position = (left, top)
+            graph_geometry = ((left + mesh_width, top), (width - mesh_width, height))
+        self.plotter = pv.Plotter(
+            title=f"Heatmap Painter - {self.input_path.name}",
+            window_size=window_size,
+        )
+        if window_position is not None:
+            self.plotter.render_window.SetPosition(*window_position)
+        self.mesh_renderer = self.plotter.renderer
         self.plotter.add_mesh(self.mesh, scalars="colors", rgb=True, pickable=True)
         self._add_pin_labels()
         self.plotter.add_axes()
         self._set_status()
+        if graph_geometry is not None:
+            self.live_graph.open_window(*graph_geometry)
         self.interactor = self.plotter.iren.interactor
         self._navigate_style = vtk.vtkInteractorStyleTrackballCamera()
         self._navigate_style.SetDefaultRenderer(self.plotter.renderer)
@@ -625,6 +684,8 @@ class HeatmapPainter:
         finally:
             if self.graph is not None:
                 self.graph.close()
+            if self.live_graph is not None:
+                self.live_graph.close()
 
 
 def paint_heatmap(input_path, graph_db=None, output_path=None, **kwargs):
@@ -647,6 +708,11 @@ def main():
         nargs="?",
         help="Optional Priority Map graph.db for live pin/score synchronization",
     )
+    parser.add_argument(
+        "--live-graph",
+        action="store_true",
+        help="Show a NetworkX knowledge graph beside the mesh and refresh it after edits",
+    )
     parser.add_argument("--output", help="Suggested Save As path; input is never overwritten automatically")
     parser.add_argument("--brush-opacity", type=float, default=DEFAULT_BRUSH_OPACITY)
     parser.add_argument(
@@ -660,6 +726,7 @@ def main():
         paint_heatmap(
             args.ply,
             graph_db=args.graph_db,
+            show_live_graph=args.live_graph,
             output_path=args.output,
             brush_opacity=args.brush_opacity,
             max_overlay_opacity=args.max_overlay_opacity,
