@@ -593,7 +593,16 @@ class HeatmapPainter:
         self.plotter.add_axes()
         self._set_status()
         self.interactor = self.plotter.iren.interactor
-        self._navigate_style = vtk.vtkInteractorStyleTrackballCamera()
+        class _PainterTrackballStyle(vtk.vtkInteractorStyleTrackballCamera):
+            """Trackball style that blocks the default VTK exit key."""
+
+            def OnKeyPress(self):
+                key = self.GetInteractor().GetKeySym()
+                if key is not None and key.lower() == "e":
+                    return
+                super().OnKeyPress()
+
+        self._navigate_style = _PainterTrackballStyle()
         self._navigate_style.SetDefaultRenderer(self.plotter.renderer)
         self._paint_style = vtk.vtkInteractorStyleUser()
         self._paint_style.SetDefaultRenderer(self.plotter.renderer)
@@ -622,7 +631,6 @@ class HeatmapPainter:
 
         self._add_heat_slider(vtk)
         self.plotter.add_key_event("p", lambda: self._set_mode("paint"))
-        # VTK reserves E for Exit; X is the erase/remove key.
         self.plotter.add_key_event("x", lambda: self._set_mode("erase"))
         self.plotter.add_key_event("n", lambda: self._set_mode("navigate"))
         self.plotter.add_key_event("minus", lambda: self._resize_brush(0.8))
